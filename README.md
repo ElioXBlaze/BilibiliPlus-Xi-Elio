@@ -59,7 +59,7 @@ iPad 上看 B 站网页版，常年会遇到几件事：
 
 1. App Store 安装 **Stay**，在 Safari 扩展里启用；
 2. 用 Safari 打开下面这个直链，Stay 会接管：
-   `https://raw.githubusercontent.com/wyh5418804/BilibiliPlus-Xi-Elio/main/BilibiliPlus-Xi-Elio.user.js`
+   `https://raw.githubusercontent.com/ElioXBlaze/BilibiliPlus-Xi-Elio/main/BilibiliPlus-Xi-Elio.user.js`
 3. 或者手动：Stay → 新建脚本 → 粘贴 `BilibiliPlus-Xi-Elio.user.js` 全文 → 保存。
 
 ### Tampermonkey / Userscripts 等
