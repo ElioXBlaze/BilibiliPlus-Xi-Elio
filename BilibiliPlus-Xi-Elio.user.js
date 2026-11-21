@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BilibiliPlus Xi/Elio · 哔哩哔哩 iPad 增强套件
 // @namespace    https://bilipad.local/suite
-// @version      2.0.2
+// @version      2.0.5
 // @description  iPad Pro / iPadOS / Safari / Stay 专用单脚本：零导航页内搜索、官方接口三连（无币自动补赞藏）、弹幕显示开关按真实状态载体校验（发弹幕完全交还 B 站官方输入框，不劫持 A / Shift+Enter）、R 键刷新推荐改为「点击后验证卡片真的变化」（不再假成功）、进播放页自动起播（静音起播 + 首次手势恢复音量 + 官方播放按钮兜底）、扩展倍速、全屏智能铺满、可避让专注条、分区与 UP 主屏蔽、无水印直链、截帧。单实例 + 命令总线 + 共享 Observer。
 // @author       Xi/Elio X. Blaze
 // @match        https://www.bilibili.com/*
@@ -31,7 +31,7 @@
     return;
   }
   const CORE = window[NS] = {
-    booted: false, version: '2.0.2', started: Date.now(), loginDiag: null,
+    booted: false, version: '2.0.5', started: Date.now(), loginDiag: null,
     modules: new Map(), logs: [], hiddenCount: 0,
     // v1.7 倍速长按：rateHold=[ / ] 的按下状态；rightHold=右方向键按下状态；
     // officialHold=B 站官方「长按右方向键 3×」生效期间（脚本此间绝不写 playbackRate）。
@@ -178,10 +178,8 @@
     confirmTriple: false,
     // 搜索：永远零导航，页内渲染结果；官方提交一律拦截
     searchMode: 'panel', searchNewTab: false, searchFallbackTab: false,
-    captureMaxWidth: 1920, downloadEnabled: true,
-    // v2.0.2：拆成两件事。横幅屏蔽只改可见性（零风险，默认开）；
-    // 主动拦截唤起链接默认关——实机证明旧链路会误伤 B 站自己的 SPA 路由。
-    blockAppBanner: true, blockAppJump: false
+    captureMaxWidth: 1920, downloadEnabled: true
+    // v2.0.5：blockAppBanner / blockAppJump 两个键已随整套功能删除
   };
 
   const savedCfg = Store.get('cfg', null);
@@ -257,7 +255,7 @@
   }
   delete CORE.autoPlayDone;
   delete CFG.volumeTouched;
-  CFG.schema = 13;
+  CFG.schema = 15;
   // 无论旧配置存过什么，这版一律清干净，确保 A / Shift+Enter 不被任何残留键位占用
   ['dmQuick', 'dmQuickAlt', 'dmQuick2', 'danmuFocus', 'danmuQuick', 'danmuSend'].forEach(k => delete CFG.shortcuts[k]);
   CFG.shortcuts.floatSearch = CFG.shortcuts.floatSearch || 'Shift+S';
@@ -266,14 +264,12 @@
   CFG.rateList = (Array.isArray(CFG.rateList) && CFG.rateList.length) ? CFG.rateList : DEFAULTS.rateList.slice();
   CFG.blockedTids = Array.isArray(CFG.blockedTids) ? CFG.blockedTids : DEFAULTS.blockedTids.slice();
   CFG.blockedUps = Array.isArray(CFG.blockedUps) ? CFG.blockedUps : [];
-  // v2.0.2 迁移：2.0.0/2.0.1 的 blockAppJump 同时管「横幅」和「跳转拦截」。
-  // 旧链路在捕获阶段 stopImmediatePropagation，会掐断 B 站的 SPA handler，
-  // 反而让浏览器按 <a> 原生 href 唤起 App（实机「开着反而跳、关了不跳」）。
-  // 现在：旧值只继承为「屏蔽横幅」，主动拦截一律重置为关，由用户重新选择。
-  if (savedCfg && savedCfg.blockAppBanner === undefined) {
-    CFG.blockAppBanner = true;
-    CFG.blockAppJump = false;
-    LOG('Migrate', 'v2.0.1 → v2.0.2：跳转拦截链路重写，旧开关值只继承为「屏蔽横幅」，主动拦截默认关闭');
+  // v2.0.5：整套「防跳转 / 去 App 横幅」已删除，连旧配置键一起清掉，
+  // 避免残留配置被旧逻辑或第三方读到，也避免迁移分支再引用已删字段。
+  if (savedCfg && (savedCfg.blockAppBanner !== undefined || savedCfg.blockAppJump !== undefined)) {
+    delete CFG.blockAppBanner;
+    delete CFG.blockAppJump;
+    LOG('Migrate', 'v2.0.5：已彻底移除防跳转 / 去 App 横幅全部功能、命令与配置键');
   }
   CORE.barPos = Store.get('barPos', null);
   // 旧版可能把专注条停在顶部搜索框附近，v1.3 一律复位到左下
@@ -523,10 +519,6 @@
     .bpe-blk:hover { opacity:1; background:#fb7299; }
     /* 仅清除 v1.0/v1.1 残留，防止旧版留在 DOM 上的类继续制造黑屏 */
     html.bpe-fill::before { display:none!important; }
-    /* v2.0.2：页面内的「打开 App」引导条。由 blockAppBanner 控制，
-       只改可见性、不碰点击；Safari 系统级 Smart App Banner 不在网页 DOM 里，
-       这条规则管不到它。 */
-    html.bpe-noapp .bpe-appbar { display:none!important; visibility:hidden!important; }
   `;
 
   /* ============================================================
@@ -2661,116 +2653,6 @@
       }
     } catch (e) { LOG('Search', 'window.open 防护未安装：' + e.message); }
   }
-  /* ============================================================
-   * v2.0.2 · 屏蔽「打开 App」横幅 / 拦截唤起 B 站 App（两件事拆开）
-   *
-   * 实机 bug：2.0.0/2.0.1 的 click 捕获监听里写了
-   *   e.stopImmediatePropagation() + e.stopPropagation()
-   * B 站点「首页 / 视频」走的是 <a> + 自己的 click handler
-   * （preventDefault + vue-router.push）。捕获阶段一 stop，
-   * B 站的 handler 根本没机会跑，浏览器只好按 <a> 的原生 href 走 ——
-   * 而 B 站给这些链接配的正是唤起 App 的地址。于是「开着反而跳、
-   * 关了反而不跳」。根因不是没拦住，是拦的时候把 B 站自己的路也断了。
-   *
-   * 现在三条硬规则：
-   *   ① 横幅屏蔽（blockAppBanner，默认开）：只移除 meta + 加 CSS class，
-   *      完全不碰任何点击、不删别人的 iframe。零导航副作用。
-   *   ② 跳转拦截（blockAppJump，默认关）：只在 href 明确是 scheme /
-   *      App Store / openapp 入口时 preventDefault()，
-   *      **绝不 stop 传播** —— 事件继续交给 B 站自己的 SPA handler。
-   *   ③ 删掉 HTMLAnchorElement.prototype.click 包装：a.click() 会 dispatch
-   *      正常 click 事件，捕获阶段的 preventDefault 已经覆盖；直接包原型
-   *      会绕过事件系统、让整次点击消失，属于冗余且有害。
-   *
-   * 查证边界：Safari 的 Smart App Banner 是 WebKit / Safari 系统级 UI，
-   * 不是网页 DOM，网页脚本删不掉「已经显示的那一条」；移除
-   * meta[name=apple-itunes-app] 是 AdGuard / Unsmartifier 的通行做法
-   * （App 未安装时有效，已安装仍可能显示）。用户点横幅左侧 × 后
-   * Safari 会记住，回到该网页不再出现，且没有 JS API 能编程恢复。
-   * ============================================================ */
-  const APP_SCHEME = /^(bilibili|bili|bilibiliipad|biliipad|bh):\/\//i;
-  const APP_TEXT = /(在\s*[「『"']?\s*哔哩哔哩|在\s*App\s*中打开|打开\s*App|App\s*内打开|打开客户端|在客户端中打开)/;
-  function appJumpUrl(u) {
-    if (typeof u !== 'string' || !u) return false;
-    const x = u.trim();
-    if (APP_SCHEME.test(x)) return true;
-    if (/(^|\/\/)(itunes|apps)\.apple\.com/i.test(x)) return true;
-    // 只认「路径本身就是唤起入口」。旧版还按 [?&]scheme= 之类参数名猜，
-    // 太宽，可能把带同名参数的正常站内链接误判成唤起。
-    if (/\/(openapp|app-launch|launch-app)(\/|\?|$)/i.test(x)) return true;
-    return false;
-  }
-  let appMetaSaved = null;
-  function syncAppMeta() {
-    const on = !!(CFG.enabled && CFG.blockAppBanner);
-    const m = document.querySelector('meta[name="apple-itunes-app"]');
-    if (on) {
-      if (m) {
-        if (!appMetaSaved) appMetaSaved = { html: m.outerHTML || '', content: m.getAttribute('content') || '' };
-        try { m.parentNode ? m.parentNode.removeChild(m) : m.remove(); }
-        catch (_) { try { m.remove(); } catch (__) {} }
-      }
-    } else if (!m && appMetaSaved) {
-      // 关掉开关时把 meta 放回 head；Safari 已渲染的横幅不会因此立刻回来
-      try {
-        const tmp = document.createElement('div');
-        tmp.innerHTML = appMetaSaved.html;
-        const node = tmp.firstElementChild;
-        if (node && document.head) document.head.appendChild(node);
-      } catch (_) {}
-    }
-  }
-  function sweepAppBanner() {
-    const on = !!(CFG.enabled && CFG.blockAppBanner);
-    // 关掉：把之前标记过的横幅还原。不再主动删除任何 iframe（与导航无关，
-    // 且移除第三方 iframe 有意料之外的副作用）。
-    if (!on) { $$('.bpe-appbar').forEach(n => n.classList.remove('bpe-appbar')); return; }
-    if ((document.documentElement.scrollTop || 0) > 400) return;
-    // 只按「明确的引导条类名 + 顶部矮条几何 + 文案」三重限定。
-    // 旧版全局扫 a/button/div/span 的文案，容易把 header、视频卡片误标成横幅，
-    // 一旦误标就会连点「首页 / 视频」都命中拦截条件。
-    try {
-      $$('[class*="open-app"], [class*="app-open"], [class*="app-banner"], [class*="app-launch"], [class*="launch-app"], [class*="app-guide"], [class*="app-download"], [class*="top-banner"], [role="banner"]').forEach(el => {
-        const r = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
-        const top = r && typeof r.top === 'number' ? r.top : 999;
-        if (!r || top > 140 || r.height > 120 || r.width < 200) return;
-        const txt = (el.textContent || '').trim();
-        if (txt && txt.length < 80 && APP_TEXT.test(txt)) el.classList.add('bpe-appbar');
-      });
-    } catch (_) {}
-  }
-  function installAppGuard() {
-    // 只拦「href 明确是唤起地址」的链接，且只 preventDefault。
-    // 不 stopPropagation / 不 stopImmediatePropagation —— B 站自己的
-    // click handler 必须照常执行，否则浏览器会回退到 <a> 的原生 href。
-    document.addEventListener('click', e => {
-      if (!CFG.enabled || !CFG.blockAppJump) return;
-      const path = (e.composedPath && e.composedPath()) || [e.target];
-      const a = path.find(n => n && n.tagName === 'A' && n.getAttribute);
-      if (!a) return;
-      const href = a.getAttribute('href') || a.href || '';
-      if (!appJumpUrl(href)) return;
-      e.preventDefault();
-      LOG('AppGuard', '已取消唤起 App 的默认导航 · 事件仍交给页面自己的路由');
-    }, true);
-    // window.open 不产生 click 事件，只能包一层；串联在搜索守卫外面，不改它。
-    try {
-      const pw = pageWindow();
-      const orig = pw.open;
-      if (orig && !orig.__bpeAppWrapped) {
-        const wrapped = function (u) {
-          if (CFG.enabled && CFG.blockAppJump && appJumpUrl(u)) {
-            LOG('AppGuard', '已拦下 window.open 唤起 App');
-            return null;
-          }
-          return orig.apply(this, arguments);
-        };
-        wrapped.__bpeAppWrapped = true;
-        pw.open = wrapped;
-      }
-    } catch (e) { LOG('AppGuard', 'window.open 防护未安装：' + e.message); }
-  }
-
   Bus.register('searchZoom', toggleNativeSearch);   // v1.9：S = 原生优先 / 没有则浮层
   Bus.register('floatSearch', toggleFloatSearch);  // v1.9：独立快捷键，永远画浮层
   Bus.register('searchGo', doSearch);
@@ -3240,7 +3122,7 @@
             '<button class="bpe-x" data-act="close">✕</button>' +
           '</div>' +
           '<div class="bpe-body"><nav class="bpe-nav"></nav><main class="bpe-content"></main></div>' +
-          '<div class="bpe-foot">v2.0.2 · BilibiliPlus Xi/Elio · by Xi/Elio X. Blaze · 不再误伤页面路由</div>' +
+          '<div class="bpe-foot">v2.0.5 · BilibiliPlus Xi/Elio · by Xi/Elio X. Blaze · 已移除防跳转 / 去 App 横幅</div>' +
         '</div>' +
         '<div class="bpe-toast" hidden></div>' +
         '<div class="bpe-kbdstate" hidden>⌨ 输入中 · 按 Esc 恢复快捷键</div>' +
@@ -3454,11 +3336,9 @@
       '<div class="bpe-grouptitle">🛡 交互习惯</div>' +
       '<div class="bpe-card">' +
         sw('confirmTriple', '三连前二次确认', '开启后按 B 会先弹确认卡，防误触') +
-        sw('blockAppBanner', '屏蔽「打开 App」横幅', '只移除引导 meta 并隐藏页面内横幅，不碰任何点击') +
-        sw('blockAppJump', '拦截唤起 App 的链接', '默认关闭；开启后只取消 scheme 链接的默认跳转，不阻断 B 站自己的页面路由') +
         '<div class="bpe-actions">' + btn('cmd:triple', '👍 试一下三连') + btn('cmd:danmu', '👁 试一下弹幕开关') + btn('cmd:refresh', 'R 刷新推荐') + '</div>' +
         hint('三连没硬币会自动补点赞 + 收藏；D 只管弹幕<b>显示</b>，发弹幕请用 B 站官方输入框；R 只在首页生效并核对卡片真的变了。') +
-        hint('「屏蔽横幅」只改可见性，零导航副作用；「拦截唤起链接」默认关，开启后<b>只 <code>preventDefault()</code>、不停事件传播</b>，B 站自己的首页 / 视频路由照常工作。<b>边界</b>：Safari 系统级智能横幅不是网页 DOM，已显示的那条脚本删不掉 —— 刷新一次，或点横幅左侧 ×（Safari 会记住不再出现）；universal link 跳转由系统接管，可长按链接选「打开」或把网址粘回地址栏。') + '</div>' +
+        '</div>' +
 
       '<div class="bpe-hint" style="margin-top:14px">📋 诊断、登录自检、Stay 能力探测、冲突排查与最近日志都在 <b>🩺 自检</b> 页；历史改动在 <b>🕘 更新日志</b> 页。</div>';
   }
@@ -3539,8 +3419,8 @@
    * ============================================================ */
   function logSections() {
     return [
-      { t: 'v2.0.2 · 不再误伤 B 站页面路由（当前）', open: true, h:
-        '<div class="bpe-card"><h3>为什么「开着反而跳 App、关了反而不跳」</h3><p>不是没拦住，是<b>拦的时候把 B 站自己的路也断了</b>。B 站点「首页 / 视频」用的是 <code>&lt;a&gt;</code> + 自己的 click handler（<code>preventDefault</code> + <code>vue-router.push</code>）；旧版 AppGuard 在<b>捕获阶段</b>调了 <code>stopImmediatePropagation()</code>，B 站的 handler 根本没机会跑，浏览器只好按 <code>&lt;a&gt;</code> 的原生 href 走 —— 而 B 站给这些链接配的正是唤起 App 的地址。关掉开关后 handler 恢复正常，所以反而不跳了。<br><br><b>修法三条</b>：① 拆成两个开关 —— <b>「屏蔽打开 App 横幅」默认开</b>（只移除 <code>apple-itunes-app</code> meta + 加 CSS class，完全不碰点击、不删 iframe）；<b>「拦截唤起 App 的链接」默认关</b>，旧开关值只继承为「屏蔽横幅」。② 重写拦截：只在 href 明确是 <code>bilibili://</code> / App Store / <code>openapp</code> 入口时 <code>preventDefault()</code>，<b>绝不 stop 传播</b>，事件继续交给 B 站的 SPA handler。③ 删掉 <code>HTMLAnchorElement.prototype.click</code> 包装（<code>a.click()</code> 会 dispatch 正常 click 事件，捕获阶段已覆盖；直接包原型会让整次点击消失）。另外收紧了横幅识别：不再全局扫 <code>a/button/div/span</code> 文案，改为「明确类名 + 顶部矮条几何 + 文案」三重限定，避免把 header / 视频卡片误标成横幅；<code>appJumpUrl</code> 也不再按 <code>[?&amp;]scheme=</code> 之类参数名猜。<br><br><b>验证口径</b>：开启两个开关后点首页 / 视频链接，B 站 handler 仍执行、不跳 App；纯 scheme 链接的默认导航被取消；关闭「拦截」后一切与 B 站原生一致；搜索零导航、三连、D 开关、R 刷新、倍速、起播、5 页签与打赏页全部回归。</p></div>' +
+      { t: 'v2.0.5 · 彻底移除防跳转 / 去 App 横幅（当前）', open: true, h:
+        '<div class="bpe-card"><h3>你让我「再检查一遍到底哪里出问题」：结论是脚本自己</h3><p>先按你的要求<b>彻底删除</b>了整套功能：两个配置键 <code>blockAppBanner / blockAppJump</code>、开关、CSS 规则、<code>APP_SCHEME / appJumpUrl / biliPageUrl</code>、<code>syncAppMeta / sweepAppBanner / installAppGuard / patchPageLocation / patchAnchorClick / installNativeNavGuard</code>、scheme iframe 清理、<code>appRules / appDiag</code> 命令与菜单入口、自检按钮与提示、更新日志里 v2.0.2~2.0.4 三张卡、教程页对应卡与独立规则文件，全部不留死代码；旧配置键在迁移时一并 <code>delete</code>。<br><br><b>复查结论（与你的实机证据一致，但如实说是最可能而非 100% 实机确认）</b>：你点的是 <code>www.bilibili.com</code> <b>站内</b>的视频 / 主页 / 关注 / 粉丝 / 动态。按 Apple 的 same-domain 规则，Safari 里已打开该域名时点<b>同域</b>链接通常留在 Safari，本来不该跳 App。它却跳了，说明这次导航<b>不是 B 站 SPA 的 <code>preventDefault</code> + <code>router.push</code></b>，而是被降级成「浏览器发起的全新整页 https 导航」，命中 AASA 的 <code>applinks</code> 路径，iOS 才把点击交给 App。谁降的级？<b>就是脚本自己</b>：① v2.0.0/2.0.1 在捕获阶段 <code>stopImmediatePropagation()</code>，掐断 B 站 SPA handler，浏览器回退到 <code>&lt;a&gt;</code> 原生 href（B 站给这些卡片配的正是唤起地址）；② v2.0.3/2.0.4 的 <code>installNativeNavGuard()</code> 在冒泡阶段读 <code>e.defaultPrevented</code> 判断「SPA 没接管」就 <code>preventDefault()</code> + <code>setTimeout(0)</code> 里 <code>location.assign(https://…)</code> —— B 站的事件委托 handler 常在更外层或后注册，脚本先跑时 <code>defaultPrevented</code> 还是 false，于是把站内 SPA 跳误判成整页导航，亲手造出一次会被系统接管的全新导航；③ <code>patchPageLocation()</code> 改 <code>Location.prototype</code>、<code>patchAnchorClick()</code> 包 <code>HTMLAnchorElement.prototype.click</code>、<code>syncAppMeta()</code> 动 <code>&lt;head&gt;</code>、<code>sweepAppBanner()</code> 扫 iframe，全是全局原型 / DOM 级干扰。<b>这正好解释你最早那句「开着反而跳、关了反而不跳」</b>：关掉开关 = 没有这套拦截 = B 站 SPA 正常工作 = 不跳。所以删除不是放弃拦截，是移除制造跳转的那一层。<br><br><b>顺带复查 <code>installSearchGuard()</code></b>：它只匹配搜索表单 <code>submit</code>、<code>search.bilibili.com</code> / <code>m.bilibili.com/search</code> / <code>/search?keyword</code> 链接，以及 <code>window.open</code> 到搜索域，<b>普通视频 / 主页链接不在匹配范围</b> —— 清白，零导航搜索原样保留。<br><br><b>验证方法</b>：覆盖粘贴并刷新 → 点视频 / 主页 / 关注 → 应留在站内。若留住，根因确认。<b>诚实边界</b>：若删除后<b>仍</b>跳，那才是纯系统层 Universal Link（链接指向 <code>space.</code> / <code>m.</code> 等已关联子域、或从别的 App 点进来），网页脚本无解，只能长按链接选「在 Safari 中打开」、卸载 B 站 App，或用 Safari 扩展（拦截100 / AdGuard / wBlock）；本脚本不再加入任何拦截代码。<br><br><b>没动的东西</b>：搜索零导航与双入口、倍速、全屏、起播收手、音量记忆、三连、D 弹幕开关、R 刷新验证、v1.7 占位文字、v2.0.1 滚动保持、5 页签与打赏页、定名与署名。仍是单 keydown / 单 keyup / 单 MutationObserver。</p></div>' +
         '' },
       { t: 'v2.0.1 · 设置页不再回顶', open: false, h:
         '<div class="bpe-card"><h3>一个小 bug 修复</h3><p>在设置页切换任意开关、或录完一个键，<code>render()</code> 会重绘 <code>.bpe-content</code> 的 <code>innerHTML</code>；旧版末尾无条件 <code>content.scrollTop = 0</code>，于是每次都跳回设置页最顶端，长长的功能开关页要重新滚下去。现在 <code>render()</code> 记住上次渲染的页签：<b>同一页内的重绘保留重绘前的 <code>scrollTop / scrollLeft</code></b>（同步还原 + 下一帧兜底，覆盖 iPad Safari 偶发忽略同步赋值）；<b>切换页签、或关闭后重新打开设置仍从顶部开始</b>，既有习惯不变。<br><br>覆盖到的触发点：24 个开关的 <code>change</code>、录键完成、分区点选、UP 名单增删、恢复默认设置、以及所有会重绘面板的操作。<b>只改 <code>render()</code> 与 <code>closePanel()</code> 两处 UI 逻辑</b>，命令注册、配置生效、搜索、倍速、全屏、起播、三连、D 开关、R 刷新一律未动。</p></div>' +
@@ -4065,14 +3945,10 @@
     fillWatchdog();   // B 站切全屏会改 DOM 类名，这里比 900ms 定时更及时
     if (CFG.enabled && (CFG.learnMode || CFG.showBlockButtons)) scanCards();
     updateBar();
-    sweepAppBanner();   // 临时补充：页面内打开 App 横幅 / scheme iframe
   }
   const observer = new MutationObserver(() => scheduleScan());
   function applyCfg() {
     document.documentElement.classList.toggle('bpe-enabled', !!CFG.enabled);
-    /* 临时补充：开关即时生效；移除 meta 让下次加载不再生成系统横幅 */
-    document.documentElement.classList.toggle('bpe-noapp', !!(CFG.enabled && CFG.blockAppBanner));
-    syncAppMeta();
     if (!CFG.enabled || !CFG.fillEnabled) resetVideoFill(true);
     else if (Fill.active) { Fill.lastMode = ''; updateVideoFill(); }
     if (!CFG.learnMode) {
@@ -4092,7 +3968,6 @@
     rebuildKeyMap();
     clearLegacyFill();          // 自救：清掉 v1.0/v1.1 留在页面上的黑屏类
     installSearchGuard();       // v1.3：拦掉 B 站原生搜索的一切跳转
-    installAppGuard();          // 临时补充：拦掉唤起 B 站 App 的链接 / 脚本
     if (CAP.menu) {
       try {
         GM_registerMenuCommand('🎛 打开 BilibiliPlus Xi/Elio 设置', () => openPanel());
