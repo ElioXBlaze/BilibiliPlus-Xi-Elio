@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BilibiliPlus Xi/Elio · 哔哩哔哩 iPad 增强套件
 // @namespace    https://bilipad.local/suite
-// @version      2.3.5
+// @version      2.5.1
 // @description  iPad Pro / iPadOS / Safari / Stay 专用单脚本：零导航页内搜索、官方接口三连（无币自动补赞藏）、弹幕显示开关按真实状态载体校验（发弹幕完全交还 B 站官方输入框，不劫持 A / Shift+Enter）、R 键刷新推荐改为「点击后验证卡片真的变化」（不再假成功）、进播放页自动起播（静音起播 + 首次手势恢复音量 + 官方播放按钮兜底）、扩展倍速、全屏智能铺满、可避让专注条、分区与 UP 主屏蔽、无水印直链、截帧。单实例 + 命令总线 + 共享 Observer。
 // @author       Xi/Elio X. Blaze
 // @match        https://www.bilibili.com/*
@@ -68,7 +68,7 @@
       { capture: true, passive: true }));
   })();
   const CORE = window[NS] = {
-    booted: false, version: '2.3.5', started: Date.now(), loginDiag: null,
+    booted: false, version: '2.5.1', started: Date.now(), loginDiag: null,
     modules: new Map(), logs: [], hiddenCount: 0,
     // v1.7 倍速长按：rateHold=[ / ] 的按下状态；rightHold=右方向键按下状态；
     // officialHold=B 站官方「长按右方向键 3×」生效期间（脚本此间绝不写 playbackRate）。
@@ -80,9 +80,11 @@
     nativeSearchDiag: null,
     // v1.8.1 工具条二级菜单：显式开合状态 + 同手势去重
     dockOpen: false, dockToggledAt: 0,
+  /* v2.5.0 · 控制台位置：{side:'left'|'right', y}；dir 为一级菜单展开方向 */
+  consolePos: null, consoleDir: 'up', consoleDragAt: 0,
     // v1.9 自绘浮层搜索：显式状态机，联想 / 分类 / 历史全在这里，避免散落全局
     floatSearch: { open: false, kw: '', tab: 'all', counts: null, results: [],
-      suggest: [], sugIndex: -1, sugSeq: 0, sugChannel: '', history: [], hot: [],
+      suggest: [], sugIndex: -1, sugSeq: 0, sugChannel: '', history: [], hot: [], sort: 'default',
       busy: false, lastError: '' },
     floatDiag: null,
     media: [], mediaMeta: null, previewBlob: null, userMuted: false,
@@ -98,6 +100,8 @@
     // volDiag=音量诊断；volSaveTimer=拖动音量条时的写入防抖。
     volSettable: null, applyingVolume: false, lastGestureAt: 0, lastMuted: null,
     volDiag: null, volSaveTimer: null,
+  /* v2.3.9：音量巩固守卫生效期间，屏蔽「B 站 state 回写」被记成用户意图 */ touchVolGuardActive: false,
+    /* v2.3.10：VolHud 直接接管 video.volume 时，用这个标记判定是否处于接管窗口 */ touchVolOwned: false,
     results: [], switchDiag: null, refreshDiag: null, refreshLock: false,
     // v2.1.0 触控倍速 / v2.1.2 移动端手势：
     // active=倍速手势进行中；touchDiag=最近一次结算；touchLock.rate=0 表示未锁定。
@@ -239,10 +243,26 @@ const DEFAULTS = {
     // floatSearch 是「无论何时都画浮层」的独立快捷键。
     nativeFallbackFloat: true, floatSuggest: true, floatHot: true, floatHistory: true,
     rateEnabled: true, rememberRate: true, rate: 1,
-    rateList: [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.5, 3, 4, 5],
+    /* v2.5.0 · 用户定义的档位体系（41 档）
+       规律：每 4 档一个「单位」，单位依次 0.25 → 0.5 → 1 → 2 → 4
+         >1：1, 1.25, 1.5, 1.75, 2 | 2.5 3 3.5 4 | 5 6 7 8 | 10 12 14 16 | 20 24 28 32
+         <1：同样 20 档，按倒数镜像（1/1.25 … 1/32），保留 4 位小数
+       键盘 [ / ] 走完整 41 档；触控长按 / 上滑只走 1×~6×（TOUCH_RATE_CAP）。 */
+    rateList: [0.0312, 0.0357, 0.0417, 0.05, 0.0625, 0.0714, 0.0833, 0.1, 0.125, 0.1429, 0.1667, 0.2, 0.25, 0.2857, 0.3333, 0.4, 0.5, 0.5714, 0.6667, 0.8, 1, 1.25, 1.5, 1.75, 2, 2.5, 3, 3.5, 4, 5, 6, 7, 8, 10, 12, 14, 16, 20, 24, 28, 32],
+    touchRateCap: 6, touchV3Rates: [1, 1.25, 1.5, 1.75, 2, 2.5, 3, 3.5, 4, 5, 6],
+    /* v2.5.0 · 人体工学固定值：以下 10 个原先是「1ms / 1px 手调」的滑块，
+       实测收敛后固定，不再出现在设置页里（用户明确说「用户不是机器」）。
+       旧配置里被调乱的值在 schema 38 迁移时统一写回。 */
+
     // v1.7：长按「相反档键」取消倍速；长按右方向键松开回 1×（不恢复旧档）；
     // 学习模式隐藏时保留容器并显示占位文字。holdThresholdMs 为长按判定阈值。
     longPressCancelRate: true, officialHoldToNormal: true,
+  /* v2.3.6 · WebKit Bug 326890：带音轨的 MSE 视频上，每一次 playbackRate
+     写入都会停止帧呈现、冻结 currentTime 约 300ms（Chrome 无此现象）。
+     所以「换档必定卡一下」是平台 bug，网页层消不掉单次那一下，
+     能做的只有：① 一次换档只写 1 次（旧版会写 2~5 次）；
+     ② 连续换档合并成最后一次写；③ 可选关掉音高保持减少音频重采样。 */
+  rateCoalesce: true, rateCoalesceMs: 160, rateNoPitch: false, rateMuteSwap: false,
     hidePlaceholder: true, holdThresholdMs: 340,
     // v2.1.0 触控倍速：长按进 2× / 按住到时锁定 / 上下滑调档 / 滑动后松手锁定
     touchRate: true, touchHoldMs: 280, touchLockSec: 10,
@@ -263,8 +283,110 @@ const DEFAULTS = {
      否则单击唤不出工具栏、双击暂停不了。关掉则回到 v2.1.7 的纯独占行为。 */
   tapPassthrough: true,
   /* v2.3.0 · 移动端同款触控（研究版，独立开关） */
+  /* v2.3.7 · 默认【按住 10 秒】才自动锁定；长按提示只显示 3 秒。
+     axisPx = 定轴阈值：手指必须先移动这么多像素才判定方向，
+     且主轴位移要 > 副轴 × 1.35，避免「左右滑稍微偏上偏下就调开亮度音量」。
+     slideScale 越大越不灵敏（亮度/音量每像素变化量 = 1/slideScale）。
+     一旦定轴，直到松手都不切换模式（「要调啥就调啥」）。 */
   touchV3: true, touchV3HoldMs: 280, touchV3LockSec: 10, touchV3SlidePx: 44,
-  touchV3Rates: [0.5, 1, 1.5, 2],
+  touchAxisPx: 28, touchAxisRatio: 1.35, touchSlideScale: 420,
+  touchHudSec: 3, touchSeekPass: true,
+  /* v2.3.8 · 「松手之后弹原生音量 HUD」：B 站识别器 down 记起点 → up 按
+     起点→终点总位移补算一次。v2.3.4 为防状态机卡死放行 end，补算就冒出来；
+     v2.3.7 水平让行后它又活跃了。现在垂直手势的 end 掐掉真实事件，
+     同步派一个「坐标=起点」的净化 end 给 B 站：状态机照常清零，
+     但算出的位移≈0 → 不弹 HUD。短按 / 水平手势完全不受影响。 */
+  touchNeutralizeNativeEnd: false,
+  /* ============================================================
+     v2.3.9 · 用户实机证据（推翻 v2.3.8 的方向）
+       · 白底「🔊 100%/50%」在松手后【仍然显示】→ 净化 end 没挡住它，
+         它是系统 / B 站播放器 state 音量，网页层无权改它的数字。
+       · 「拖到 20% 时实际音量真的跟手降了，一松手弹回 50%」→
+         说明 video.volume 在这台 iPad 上【可写且生效】（旧文档「只读恒 1」
+         的判断不成立），但松手时有人把 state 值回写覆盖 element.volume。
+       · 「保持一会儿才有概率同步」→ 采纳是延迟/防抖的；
+         把用户手工发现的 workaround 变成代码保证。
+       · v2.3.8 派的两个零位移 touchend/pointerup 副本很可能正是
+         「让 B 站走完手势结算 → 把 state 音量写回 element」的触发器，
+         即「这回一放手就回弹」是上一版引入的。故默认关掉净化。
+     解法不再跟 end 较劲，而是松手后把 element.volume 钉住一段时间：
+       volumechange 守卫 + 0/120/300/600ms 幂等复查 + 同步记忆值。
+     ============================================================ */
+  touchVolumeHold: true, touchVolumeHoldMs: 900, touchVolumePin: false,
+  /* ============================================================
+     v2.3.10 · 按你的判断改：白胶囊当【B 站网页 DOM】处理，不再拿「系统层
+     网页无权改」当挡箭牌。两件事一起做：
+       ① touchKillVolHud：document 级 CSS + 单 Observer 复用重扫 + 文案/类名
+          扫描，命中的 B 站音量 HUD 一律 display:none!important。
+       ② touchOwnVolume：在 <video> 实例上定义 own volume 描述符，守卫窗口内
+          直接吞掉 B 站对 video.volume 的写入（不是事后纠正），从根上接管网页
+          音量；描述符拿不到才回退 v2.3.9 的 volumechange 守卫。
+     守卫期外两者都完全放行，B 站音量滑块 / 系统侧键照常。
+     ============================================================ */
+  touchKillVolHud: true, touchOwnVolume: true,
+  /* ============================================================
+     v2.4.0 · 后台播放 / 画中画 / 控制中心
+     ------------------------------------------------------------
+     用户要复现「过去用系统播放器」的三件事：
+       ① 切别的网页 / 别的应用 → 自动小窗继续播放
+       ② 控制中心 / 锁屏能显示正在播什么
+       ③ 控制中心点继续 / 暂停能真的控制网页视频
+     查证结论（写进教程页，不编造）：
+       · Apple 官方《Adding Picture in Picture to Your Safari Media Controls》：
+         webkitSupportsPresentationMode('picture-in-picture') +
+         webkitSetPresentationMode('picture-in-picture') 是 Safari 自定义控件
+         进 PiP 的官方路径；官方示例绑在按钮 click 里。
+       · MDN：requestPictureInPicture() 需要瞬态用户激活，Safari on iOS 13.4+
+         完全支持；visibilitychange 里手势已过期，标准 API 可能被拒。
+       · 因此双通道：标准 API 优先 → 被拒回退 WebKit 私有 API → 都不行如实提示，
+         绝不假装成功。手势内预热 autoPictureInPicture / 属性 / Media Session。
+       · Media Session：Safari iOS 15 起 setActionHandler 可用、MediaMetadata
+         Safari 14；iOS 锁屏/控制中心 play/pause 有效，prev/next 有已知 quirk
+         （故不注册切曲）；metadata 需要真实播放 + 音频焦点，静音不显示控件；
+         setPositionState 要手动更新。
+       · 系统前置：设置 → 通用 → 画中画 → 「自动开启画中画」开；
+         地址栏 AA / 锁形 → 画中画 → 允许；改 Experimental Features 后重开标签页。
+     与「彻底弃用系统全屏」不矛盾：PiP 是 presentationMode 而非 fullscreen，
+     不调用 webkitEnterFullscreen，也不碰 requestFullscreen。
+     ============================================================ */
+  /* v2.4.1 · 真机反馈 + Apple DTS 结论后的纠错，见本段下方长注释 */
+  bgPlay: true, bgAutoPip: false, bgExitOnReturn: false,
+  bgMediaSession: true, bgMetadata: true, bgPrewarm: true,
+  bgPipButton: true, bgNativePlayer: false,
+  /* ============================================================
+     v2.4.1 · 为什么「切后台自动小窗」必须停用（不是脚本 bug）
+     ------------------------------------------------------------
+     用户实机：退出 Safari 会自动暂停；控制中心能继续播放但只有声音；
+     换别的网页 / 退出 Safari 都没有小窗。
+     Apple Developer Forums 819235（DTS 工程师回复）逐条验证过，与实机逐字吻合：
+       1) <video autopictureinpicture playsinline> —— inline 播放态 WKWebView
+          根本不认这个属性，只有「从 fullscreen 转后台」才生效。
+       2) visibilitychange 里 requestPictureInPicture()
+          → "not triggered by user activation"。
+       3) visibilitychange 里 webkitSetPresentationMode('picture-in-picture')
+          → 不抛错、webkitpresentationmodechanged 也派发 picture-in-picture，
+            但【PiP 窗口根本不渲染】。← v2.4.0 把这种「静默接受」记成了
+            enters 成功，是假成功，必须纠正。
+       4) await play() 后再调 → 音频恢复（正对应「只能听个声」），PiP 仍不开。
+       5) iOS 切后台事件顺序是 pause → visibilitychange hidden
+          ← 正对应「退出 Safari 会自动暂停」；v2.4.0 的 onHidden 又因
+          v.paused 直接 return，连尝试都没做。
+       DTS 结论原文：没有用户交互就想自动切 PiP，需要 inline video 使用
+       AVPlayerViewController（canStartPictureInPictureAutomaticallyFromInline
+       是原生属性，网页无对应开关）；playsinline 不会把视频交给它。
+       Fullscreen → background 自动 PiP 是确认可用的。
+     ------------------------------------------------------------
+     所以这版改成两条【真实可用】路径，并把假的自动路径默认停用：
+       A. ⧉ 手势内建窗（默认）：画面角落小按钮 / Stay 菜单，在 click 的
+          同步栈里调 webkitSetPresentationMode（Apple 官方自定义控件示例
+          就是绑在按钮 click 里）。PiP 一旦在页面活跃时建立，之后切别的网页、
+          退出 Safari、锁屏前的多任务切换都由系统继续渲染与解码。
+       B. 可选恢复原生播放器（默认关）：放开 webkitEnterFullscreen，让 B 站
+          全屏按钮进 AVPlayerViewController，再由系统 fullscreen→后台自动 PiP。
+          代价：那一层网页收不到触摸，本脚本所有触控手势失效（v2.1.3 的历史）。
+     Media Session 保持不变 —— 用户已证实控制中心「继续」能恢复声音，说明
+     这块是生效的；暂停不再由脚本抢播，符合用户意志。
+     ============================================================ */
   /* v2.3.2 · 独占手势 + 新音量档位 */
   touchBlockNative: true, touchVolume: 0.8,
   /* v2.3.4 · 绝不能掐 end：B 站手势识别器靠 pointerup/touchend 结束状态机，
@@ -280,7 +402,7 @@ const DEFAULTS = {
       refresh: 'r', danmu: 'd',
       searchZoom: 's', floatSearch: 'Shift+S', triple: 'b', capture: 'c',
       fullscreen: 'f', fillToggle: 'Shift+F', fillReset: 'Shift+R', mute: 'm',
-      rateDown: '[', rateUp: ']', learn: 'g'
+      rateDown: '[', rateUp: ']', learn: 'g', bgPip: 'p'
     },
     confirmTriple: false,
     // 搜索：永远零导航，页内渲染结果；官方提交一律拦截
@@ -288,6 +410,17 @@ const DEFAULTS = {
     captureMaxWidth: 1920, downloadEnabled: true
     // v2.0.5：blockAppBanner / blockAppJump 两个键已随整套功能删除
   };
+
+  const ERGO = {
+      holdThresholdMs: 340, rateCoalesceMs: 160,
+      touchV3HoldMs: 280, touchV3LockSec: 10, touchV3SlidePx: 44,
+      touchVolumeHoldMs: 900, touchAxisPx: 28, touchAxisRatio: 1.35,
+      touchSlideScale: 420, touchHudSec: 3
+    }
+
+  /* v2.5.1 · 右下角是 iPadOS Safari 窗口化「拖角调整窗口大小」的触发区，
+     控制台图标落在那儿会抢系统手势。140px 见方内一律不吸附、不默认。 */
+  const CORNER_SAFE = 140;
 
   const savedCfg = Store.get('cfg', null);
   let CFG = Object.assign({}, DEFAULTS, savedCfg || {});
@@ -362,7 +495,7 @@ const DEFAULTS = {
   }
   delete CORE.autoPlayDone;
   delete CFG.volumeTouched;
-  CFG.schema = 30;
+  CFG.schema = 39;
   // 无论旧配置存过什么，这版一律清干净，确保 A / Shift+Enter 不被任何残留键位占用
   ['dmQuick', 'dmQuickAlt', 'dmQuick2', 'danmuFocus', 'danmuQuick', 'danmuSend'].forEach(k => delete CFG.shortcuts[k]);
   CFG.shortcuts.floatSearch = CFG.shortcuts.floatSearch || 'Shift+S';
@@ -394,6 +527,79 @@ const DEFAULTS = {
   if (savedCfg && (!savedCfg.schema || savedCfg.schema < 18)) {
     delete CFG.webFullscreenFirst;
     LOG('Migrate', 'v2.1.2 → v2.1.3：弃用系统全屏 / 原生视频全屏');
+  }
+  // v2.5.0 → v2.5.1：旧版控制台默认 / 吸附在右下角，纠正到右侧中部。
+  if (savedCfg && (!savedCfg.schema || savedCfg.schema < 39)) {
+    try {
+      const cp = Store.get('consolePos', null);
+      if (cp && cp.side === 'right') {
+        const vh = window.innerHeight || 1024;
+        const maxY = vh - 56 - CORNER_SAFE;
+        if (!isFinite(cp.y) || cp.y > maxY) {
+          cp.y = Math.round((vh - 56) / 2);
+          Store.set('consolePos', cp);
+          LOG('Migrate', 'v2.5.0 → v2.5.1：控制台位置从右下角禁区移到右侧中部');
+        }
+      }
+    } catch (_) {}
+  }
+  // v2.4.1 → v2.5.0：档位体系换成用户定义的 41 档；微调参数固定成人体工学值。
+  if (savedCfg && (!savedCfg.schema || savedCfg.schema < 38)) {
+    CFG.rateList = DEFAULTS.rateList.slice();
+    CFG.touchRateCap = 6;
+    CFG.touchV3Rates = DEFAULTS.touchV3Rates.slice();
+    Object.keys(ERGO).forEach(k => { CFG[k] = ERGO[k]; });
+    if (CFG.shortcuts && !CFG.shortcuts.bgPip) CFG.shortcuts.bgPip = 'p';
+    try { Store.set('cfg', CFG); } catch (e) {}
+    LOG('Migrate', 'v2.4.1 → v2.5.0：41 档倍速 / 触控上限 6× / 10 项微调固定 / 小窗快捷键 P');
+  }
+  // v2.4.0 → v2.4.1：实机 + Apple DTS 证明自动 PiP 是假成功，强制关掉。
+  if (savedCfg && (!savedCfg.schema || savedCfg.schema < 37)) {
+    CFG.bgAutoPip = false;                 // 纠错写回，不是缺省补值
+    ['bgPipButton', 'bgNativePlayer'].forEach(k => {
+      if (CFG[k] === undefined) CFG[k] = DEFAULTS[k];
+    });
+    try { Store.set('cfg', CFG); } catch (e) {}
+    LOG('Migrate', 'v2.4.0 → v2.4.1：停用假自动 PiP / 新增手势内建窗与原生播放器开关');
+  }
+  // v2.3.10 → v2.4.0：后台播放 / 画中画 / 控制中心。
+  if (savedCfg && (!savedCfg.schema || savedCfg.schema < 36)) {
+    ['bgPlay', 'bgAutoPip', 'bgExitOnReturn', 'bgMediaSession', 'bgMetadata', 'bgPrewarm'].forEach(k => {
+      if (CFG[k] === undefined) CFG[k] = DEFAULTS[k];
+    });
+    try { Store.set('cfg', CFG); } catch (e) {}
+    LOG('Migrate', 'v2.3.10 → v2.4.0：新增后台小窗 / Media Session 控制中心');
+  }
+  // v2.3.9 → v2.3.10：屏蔽白胶囊 + 接管网页音量。
+  if (savedCfg && (!savedCfg.schema || savedCfg.schema < 35)) {
+    ['touchKillVolHud', 'touchOwnVolume'].forEach(k => {
+      if (CFG[k] === undefined) CFG[k] = DEFAULTS[k];
+    });
+    try { Store.set('cfg', CFG); } catch (e) {}
+    LOG('Migrate', 'v2.3.9 → v2.3.10：新增白胶囊屏蔽 / 实例层音量接管');
+  }
+  // v2.3.8 → v2.3.9：实机证明净化 end 无效且引入松手回弹，强制关掉。
+  if (savedCfg && (!savedCfg.schema || savedCfg.schema < 34)) {
+    CFG.touchNeutralizeNativeEnd = false;      // 不是「缺省补值」，是纠错写回
+    ['touchVolumeHold', 'touchVolumeHoldMs', 'touchVolumePin'].forEach(k => {
+      if (CFG[k] === undefined) CFG[k] = DEFAULTS[k];
+    });
+    try { Store.set('cfg', CFG); } catch (e) {}
+    LOG('Migrate', 'v2.3.8 → v2.3.9：净化 end 强制关 / 启用音量巩固守卫');
+  }
+  // v2.3.7 → v2.3.8：松手净化 B 站原生音量 HUD。
+  if (savedCfg && (!savedCfg.schema || savedCfg.schema < 33)) {
+    if (CFG.touchNeutralizeNativeEnd === undefined) CFG.touchNeutralizeNativeEnd = DEFAULTS.touchNeutralizeNativeEnd;
+    try { Store.set('cfg', CFG); } catch (e) {}
+    LOG('Migrate', 'v2.3.7 → v2.3.8：松手净化原生 HUD / 竖条去过渡');
+  }
+  // v2.3.6 → v2.3.7：轴向锁定 / 长按提示 3 秒 / 水平手势交还 B 站原生进度。
+  if (savedCfg && (!savedCfg.schema || savedCfg.schema < 32)) {
+    ['touchAxisPx', 'touchAxisRatio', 'touchSlideScale', 'touchHudSec', 'touchSeekPass'].forEach(k => {
+      if (CFG[k] === undefined) CFG[k] = DEFAULTS[k];
+    });
+    try { Store.set('cfg', CFG); } catch (e) {}
+    LOG('Migrate', 'v2.3.6 → v2.3.7：轴向锁定 / 长按提示 3s / 水平让行 B 站 seek');
   }
   // v2.3.3 → v2.3.4：掐 end 会让 B 站手势状态机卡死（松手后仍调音量 / 左右拖 seek / 单击变进度）。
   if (savedCfg && (!savedCfg.schema || savedCfg.schema < 29)) {
@@ -702,6 +908,32 @@ const DEFAULTS = {
   /* v1.2：全屏不再注入任何全局 CSS。铺满只通过 JS 给 <video> 加 inline style，
      不 fixed 容器、不加黑底覆盖层、不改 body —— 从根上杜绝「整页黑屏」。 */
   const PAGE_CSS = `
+    /* ============================================================
+       v2.5.1 · 全局限制选中（用户实机：鼠标拖控制台图标 / 触控手势总触发选中）
+       思路：整页默认 none → 只给「纯文本叶子元素」和表单显式开 text。
+       :has(*) 用来判定「大容器」（有任意子元素就不开），:empty 排除空节点；
+       图标 / 按钮 / 媒体 / 类名带 icon|btn|ctrl 的一律不给选。
+       iPadOS 27 / Safari 26+ 支持 :has()；老版本走 @supports not 兜底，
+       只放行常见文本标签，不会退回「整页随便选」。
+       ============================================================ */
+    html body, html body *:not(input):not(textarea):not(select):not([contenteditable]) {
+      -webkit-user-select:none!important; user-select:none!important; }
+    html body input, html body textarea, html body select,
+    html body [contenteditable]:not([contenteditable="false"]) {
+      -webkit-user-select:text!important; user-select:text!important; }
+    img, svg, canvas, video, audio, picture, iframe, button, [role="button"],
+    [data-bpe-noselect], [class*="icon"], [class*="bpx-player-ctrl-btn"] {
+      -webkit-user-select:none!important; user-select:none!important;
+      -webkit-touch-callout:none!important; }
+    img, svg, a { -webkit-user-drag:none!important; }
+    @supports selector(:has(*)) {
+      html body :is(p,span,div,h1,h2,h3,h4,h5,h6,li,dd,dt,blockquote,figcaption,td,th,label,code,pre,time,small,em,strong,b,i,a):not(:has(*)):not(:empty):not(button):not([role="button"]):not([data-bpe-noselect]):not([class*="icon"]):not([class*="btn"]):not([class*="ctrl"]) {
+        -webkit-user-select:text!important; user-select:text!important; }
+    }
+    @supports not (selector(:has(*))) {
+      html body :is(p,h1,h2,h3,h4,h5,h6,li,dd,dt,blockquote,figcaption,td,th,label,code,pre,time,small,em,strong,b,i):not(:empty):not(button):not([data-bpe-noselect]):not([class*="icon"]):not([class*="btn"]):not([class*="ctrl"]) {
+        -webkit-user-select:text!important; user-select:text!important; }
+    }
     /* v1.7：默认「彻底隐藏」；加 bpe-ph 后改为「保留容器几何 + 占位文字」。
        只软隐藏直接子元素（visibility 保留布局盒子），不改 display，
        所以卡片高度 / grid 占位完全不变，空白容器里就能填上文字。 */
@@ -784,7 +1016,16 @@ const DEFAULTS = {
     @media (prefers-color-scheme:dark) { :host { --bg:rgba(26,27,33,.90); --fg:#f3f4f8; --sub:#9ba1ad;
       --line:rgba(255,255,255,.11); --card:rgba(44,46,55,.74); --soft:rgba(255,255,255,.08);
       --shadow:0 24px 70px rgba(0,0,0,.6); } }
-    * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+    * { box-sizing:border-box; -webkit-tap-highlight-color:transparent;
+      -webkit-user-select:none; user-select:none; -webkit-touch-callout:none; }
+    /* v2.5.1 · shadow 内同样只让「纯文本叶子」与输入框可选中，
+       控制台图标 / 按钮 / chip 拖动时不会再拉出蓝色选区 */
+    .bpe-stage input, .bpe-stage textarea, .bpe-stage select, .bpe-code {
+      -webkit-user-select:text; user-select:text; }
+    @supports selector(:has(*)) {
+      .bpe-stage :not(:has(*)):not(:empty):not(button):not(input):not(textarea):not(select):not([class*="icon"]):not([class*="btn"]) {
+        -webkit-user-select:text; user-select:text; }
+    }
     .bpe-stage { position:fixed; inset:0; z-index:2147483600; pointer-events:none; color:var(--fg); font-size:14px; }
     .bpe-stage button, .bpe-stage input, .bpe-stage select { font-family:inherit; }
     .bpe-stage button { cursor:pointer; }
@@ -794,18 +1035,37 @@ const DEFAULTS = {
        现在：dock 2147483600 < mask 2147483605 < panel 2147483610 < toast 2147483620。 */
     .bpe-mask { position:fixed; inset:0; z-index:2147483605; background:rgba(10,12,22,.42); backdrop-filter:blur(8px);
       -webkit-backdrop-filter:blur(8px); pointer-events:auto; }
+    /* v2.5.0 · 控制台可拖动：位置完全由 JS 用 left/top 定位，松手吸附就近边缘；
+       dragging 期间关掉过渡，避免每帧被动画拖慢。touch-action:none 防止 iPad
+       把拖 FAB 的手势判成页面滚动（短按 click 仍完整保留）。 */
     .bpe-fab { position:fixed; right:18px; bottom:calc(18px + env(safe-area-inset-bottom)); width:56px; height:56px;
-      border-radius:20px; border:1px solid rgba(255,255,255,.5); pointer-events:auto;
+      border-radius:20px; border:1px solid rgba(255,255,255,.5); pointer-events:auto; touch-action:none;
       background:linear-gradient(145deg,var(--pink),#f45c8f); color:#fff; font-size:23px;
-      box-shadow:0 12px 34px rgba(251,114,153,.46); transition:transform .22s cubic-bezier(.2,.9,.3,1.3); }
+      box-shadow:0 12px 34px rgba(251,114,153,.46);
+      transition:left .26s cubic-bezier(.2,.9,.3,1.1), top .26s cubic-bezier(.2,.9,.3,1.1), transform .22s cubic-bezier(.2,.9,.3,1.3); }
+    .bpe-fab.dragging { transition:none; }
     .bpe-fab:active { transform:scale(.9) rotate(-12deg); }
+    /* v2.5.0 · 一级菜单方向由 applyConsolePos() 决定：上方空间不足向下，反之向上。
+       水平位置跟随 FAB 吸附的边；align-items 随方向切换，保持贴近边缘。 */
     .bpe-dock { position:fixed; right:20px; bottom:calc(84px + env(safe-area-inset-bottom)); pointer-events:auto;
-      display:flex; flex-direction:column; gap:10px; align-items:flex-end; }
-    .bpe-dock .bpe-mini { min-width:44px; height:44px; padding:0 12px; border-radius:14px; border:1px solid var(--line);
+      display:flex; flex-direction:column; gap:10px; align-items:flex-end;
+      transition:top .26s cubic-bezier(.2,.9,.3,1.1), bottom .26s cubic-bezier(.2,.9,.3,1.1); }
+    .bpe-dock.at-left { align-items:flex-start; }
+    .bpe-dock.expand-down { flex-direction:column; }
+    .bpe-dock .bpe-mini { min-width:44px; height:44px; padding:0 10px 0 12px; border-radius:14px; border:1px solid var(--line);
+      display:inline-flex; align-items:center; gap:9px; justify-content:space-between;
       background:var(--bg); color:var(--fg); font-size:13px; font-weight:600; backdrop-filter:blur(18px);
       -webkit-backdrop-filter:blur(18px); box-shadow:0 8px 24px rgba(0,0,0,.16); }
     .bpe-dock .bpe-mini.on { background:linear-gradient(145deg,var(--pink),#f45c8f); color:#fff; border-color:transparent; }
-    .bpe-panel { position:fixed; right:14px; bottom:calc(84px + env(safe-area-inset-bottom)); z-index:2147483610;
+    /* v2.5.1 · 一级菜单右侧显示当前热键；录键改绑后即时刷新，没绑键的按钮为空 */
+    .bpe-mini-key { font-style:normal; font-size:10.5px; font-weight:700; line-height:1;
+      min-width:19px; padding:3px 6px; border-radius:6px; background:var(--soft);
+      color:var(--sub); border:1px solid var(--line); text-align:center; white-space:nowrap; }
+    .bpe-mini-key:empty { display:none; }
+    .bpe-dock .bpe-mini.on .bpe-mini-key { background:rgba(255,255,255,.22); color:#fff; border-color:transparent; }
+    /* v2.5.1 · 设置窗口居中，不再贴右下（那里既是窗口化拖角区，也常被 dock 压住） */
+    .bpe-panel { position:fixed; left:50%; top:50%; right:auto; bottom:auto;
+      transform:translate(-50%,-50%); z-index:2147483610;
       width:min(760px,calc(100vw - 28px)); height:min(620px,calc(100dvh - 120px)); pointer-events:auto;
       display:flex; flex-direction:column; border-radius:24px; overflow:hidden;
       background:var(--bg); backdrop-filter:blur(28px); -webkit-backdrop-filter:blur(28px);
@@ -930,16 +1190,19 @@ const DEFAULTS = {
        · 非全屏：竖条放 video 矩形外侧，倍速放画面上方外侧
        · 全屏：竖条贴屏幕左右边缘，倍速放画面顶端
        ============================================================ */
+    /* v2.3.8 · 「不太跟手，慢半拍」真因之一：旧版 level 有 opacity .1s、
+       填充 i 有 height .07s，连续 move（≈16ms/帧）会让过渡不断重启，
+       填充条永远在追赶目标，肉眼就是慢半拍。手势 HUD 全部改成硬切。 */
     .bpe-tv-level { position:fixed; z-index:2147483622; pointer-events:none;
       display:none; flex-direction:column; align-items:center; gap:5px;
-      opacity:.52; transition:opacity .1s; }
+      opacity:.52; transition:none; }
     .bpe-tv-level.on { display:flex; }
     .bpe-tv-emo { font-size:13px; line-height:1; text-shadow:0 1px 3px rgba(0,0,0,.65); }
     .bpe-tv-track { width:7px; height:118px; border-radius:99px;
       background:rgba(255,255,255,.14); overflow:hidden;
       display:flex; align-items:flex-end; box-shadow:0 1px 6px rgba(0,0,0,.22); }
     .bpe-tv-track > i { display:block; width:100%; height:0%; border-radius:99px;
-      background:rgba(255,255,255,.78); transition:height .07s linear; }
+      background:rgba(255,255,255,.78); transition:none; }
     .bpe-tv-pct { font-size:10px; color:#fff; letter-spacing:.2px;
       font-variant-numeric:tabular-nums; text-shadow:0 1px 3px rgba(0,0,0,.7); }
     .bpe-tv-rate { position:fixed; z-index:2147483622; pointer-events:none;
@@ -1027,6 +1290,38 @@ const DEFAULTS = {
     .bpe-fs-chip:active { background:#373944; }
     .bpe-fs-chip.hot b { color:#ff6b6b; font-weight:700; margin-right:6px; font-size:11px; }
     /* 实时联想词条：紧贴输入框下方，和原生下拉同一观感 */
+    /* v2.5.0 · 仿官方综合结果页：排序条 / 番剧大卡 / 视频小卡网格 */
+    .bpe-fs-sort { display:flex; align-items:center; gap:6px; padding:2px 4px 12px; flex-wrap:wrap; }
+    .bpe-fs-sort button { border:0; background:#23242c; color:#a9abb6; font-size:12px; padding:6px 12px;
+      border-radius:6px; cursor:pointer; font-family:inherit; }
+    .bpe-fs-sort button.on { background:rgba(0,174,236,.16); color:#00aeec; font-weight:700; }
+    .bpe-fs-more { margin-left:auto; color:#8b8d98; font-size:12px; }
+    .bpe-fs-head { display:flex; align-items:baseline; gap:10px; margin:8px 4px 10px; }
+    .bpe-fs-head b { font-size:14px; color:#e3e5e7; }
+    .bpe-fs-head span { font-size:11.5px; color:#8b8d98; }
+    .bpe-fs-pgrid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; margin:0 4px 8px; }
+    .bpe-fs-pcard { display:flex; gap:10px; background:#23242c; border-radius:10px; padding:8px; cursor:pointer; min-width:0; }
+    .bpe-fs-pcard > img, .bpe-fs-pcard > .ph { width:86px; height:116px; object-fit:cover; border-radius:7px; flex:0 0 86px; background:#30313a; }
+    .bpe-fs-pcard .tx { display:flex; flex-direction:column; gap:4px; min-width:0; flex:1; }
+    .bpe-fs-pcard .tx b { font-size:13px; line-height:1.35; color:#e3e5e7; display:-webkit-box; -webkit-line-clamp:2;
+      -webkit-box-orient:vertical; overflow:hidden; }
+    .bpe-fs-pcard .tx small { font-size:11px; color:#9496a0; line-height:1.4; display:-webkit-box; -webkit-line-clamp:3;
+      -webkit-box-orient:vertical; overflow:hidden; }
+    .bpe-fs-pcard .tag { background:rgba(251,114,153,.18); color:#fb7299; border-radius:4px; padding:1px 5px; font-size:10.5px; margin-right:4px; }
+    .bpe-fs-score { color:#ffb027; font-size:12px; font-weight:700; }
+    .bpe-fs-watch { align-self:flex-start; background:#00aeec; color:#fff; font-size:11px; padding:4px 10px; border-radius:5px; }
+    .bpe-fs-seeall { text-align:center; color:#00aeec; font-size:12px; padding:9px; margin:0 4px 14px;
+      background:#23242c; border-radius:8px; cursor:pointer; }
+    .bpe-fs-vgrid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px; margin:0 4px 14px; }
+    .bpe-fs-vcard { cursor:pointer; min-width:0; }
+    .bpe-fs-vthumb { position:relative; width:100%; aspect-ratio:16/10; border-radius:7px; overflow:hidden; background:#30313a; }
+    .bpe-fs-vthumb img { width:100%; height:100%; object-fit:cover; }
+    .bpe-fs-dur { position:absolute; right:5px; bottom:5px; background:rgba(0,0,0,.66); color:#fff;
+      font-size:10px; padding:1px 5px; border-radius:3px; }
+    .bpe-fs-vcard b { display:block; font-size:12px; line-height:1.35; color:#e3e5e7; margin-top:6px;
+      display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
+    .bpe-fs-vcard small { display:block; font-size:10.5px; color:#9496a0; margin-top:3px;
+      white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
     .bpe-fs-sug { margin:0 4px 12px; border-radius:10px; background:#26272f; overflow:hidden;
       border:1px solid rgba(255,255,255,.07); }
     .bpe-fs-sugrow { display:flex; align-items:center; gap:10px; padding:10px 13px; cursor:pointer;
@@ -1109,25 +1404,85 @@ const DEFAULTS = {
   const Rate = {
     applying: false, intent: null, pending: null, frame: 0, watchdog: null,
     saveTimer: null, toastKey: '', toastAt: 0,
+    /* ============================================================
+       v2.3.6 · 统一倍速写入闸门（针对「换档必定卡一下」）
+       证据：WebKit Bug 326890（2026-10，iOS 27 / Safari 26）——
+       「every playbackRate change on MediaSource video with an audio track
+       stops frame presentation and freezes currentTime for about 300 ms」；
+       Bug 323487 同版本报告「改倍速 0.2–0.4s lag/stutter/pause」。
+       结论：单次写入的那一下卡顿网页层消不掉，但旧版一次换档会写多次：
+         · ratechange → Rate.correct() 再写一次
+         · loadedmetadata/playing → restoreRate() 写回一次
+         · probeRates()/rateTest() 连写 4~5 次（连诊断都会卡）
+         · 触控上滑每跨一档同步写一次
+       全部收敛到这个闸门：短窗口内只写最后一次，写入后设静默期挡掉
+       correct / restoreRate 的重复写，静默期结束只在「确实被改回」时复核一次。
+       ============================================================ */
+    writes: 0, coalesced: 0, suppressed: 0, verified: 0,
+    silenceUntil: 0, silenceMs: 420, debounce: null, verifyTimer: null,
+    lastVideo: null,
+    pitch(off, v) {
+      if (!v) return false;
+      let did = false;
+      try {
+        if ('preservesPitch' in v) { v.preservesPitch = !off; did = true; }
+        if ('webkitPreservesPitch' in v) { v.webkitPreservesPitch = !off; did = true; }
+        if ('mozPreservesPitch' in v) { v.mozPreservesPitch = !off; did = true; }
+      } catch (_) {}
+      return did;
+    },
     set(v, r, opts) {
       if (!v) return false;
       const o = opts || {};
-      const rate = Math.min(16, Math.max(0.0625, Number(r) || 1));
+      /* v2.5.0：旧 clamp(0.0625, 16) 是 11 档时代的保险，会把 32× 砍成 16×、
+       把 0.031× 抬成 0.0625×。现在以档位表边界为限，写入后仍读回验证。 */
+    const RL = (Array.isArray(CFG.rateList) && CFG.rateList.length)
+      ? CFG.rateList : [0.0312, 32];
+    const rate = Math.min(Number(RL[RL.length - 1]) || 32,
+      Math.max(Number(RL[0]) || 0.0312, Number(r) || 1));
       this.pending = { v: v, rate: rate, remember: !!o.remember,
         quiet: !!o.quiet, tag: o.tag || '' };
+      /* 意图立刻同步：ratechange 里的 correct() 不能再拿旧 intent 把新档位改回去 */
+      this.intent = rate;
+      this.lastVideo = v;
+      const ms = (CFG.rateCoalesce === false || o.immediate) ? 0
+        : Math.max(0, Math.min(600, Number(CFG.rateCoalesceMs) || 0));
+      if (ms > 0 && !(CORE.officialHold && CORE.officialHold.active)) {
+        /* 合并窗口：连续按 ] ] ] / 触控连跨档 → 只写最后一次。
+           不排 rAF 也不排 watchdog，否则会提前写、把合并打散。 */
+        this.coalesced++;
+        if (this.debounce) clearTimeout(this.debounce);
+        this.debounce = setTimeout(() => { this.debounce = null; this.flush(); }, ms);
+        return true;
+      }
+      if (this.debounce) { clearTimeout(this.debounce); this.debounce = null; }
       if (this.frame && this.watchdog) return true;
       this.frame = raf(() => {
         this.frame = 0;
         if (this.watchdog) { clearTimeout(this.watchdog); this.watchdog = null; }
         this.flush();
       });
-      /* v2.1.2：iPad Safari 全屏播放时 requestAnimationFrame 会被节流甚至暂停。
-         排一个 90ms 定时器兜底，flush() 本身幂等（pending 被消费即返回），
-         双保险下仍只写一次 playbackRate，不会重新引入「连拍解码器」。 */
+      /* v2.1.2：iPad Safari 全屏播放时 requestAnimationFrame 会被节流甚至暂停，
+         90ms 定时器兜底；flush() 幂等，双保险下仍只写一次。 */
       if (!this.watchdog) this.watchdog = setTimeout(() => {
         this.watchdog = null; this.frame = 0; this.flush();
       }, 90);
       return true;
+    },
+    /* 静默期结束后只做一次「确实被改回」的复核；正常换档不会多写一次 */
+    verify(v) {
+      if (this.verifyTimer) clearTimeout(this.verifyTimer);
+      this.verifyTimer = setTimeout(() => {
+        this.verifyTimer = null;
+        if (!v || this.intent === null) return;
+        if (CORE.officialHold && CORE.officialHold.active) return;
+        if (Math.abs(v.playbackRate - this.intent) <= 0.001) return;
+        this.verified++;
+        this.applying = true;
+        try { v.playbackRate = this.intent; } catch (_) {}
+        raf(() => { this.applying = false; });
+        LOG('Rate', '静默期复核 → ' + this.intent + '×（仅被改回时才写）');
+      }, this.silenceMs + 12);
     },
     flush() {
       const p = this.pending; this.pending = null;
@@ -1138,8 +1493,23 @@ const DEFAULTS = {
         return;
       }
       this.intent = p.rate;
+      this.lastVideo = p.v;
+      /* 可选：关掉音高保持（默认关）——不做 time-stretch 重采样，
+         可减轻音频侧开销；但声音会变尖，学习类视频不一定合适。
+         注意：这不能消除 Bug 326890 的帧冻结，只减音频 DSP 负担。 */
+      this.pitch(CFG.rateNoPitch === true, p.v);
+      /* 实验项：写入前后临时静音，试图绕开带音轨管线的重配。
+         默认关，不承诺有效。 */
+      let muteUndo = null;
+      if (CFG.rateMuteSwap === true && !p.v.muted) {
+        try { p.v.muted = true; muteUndo = () => { try { p.v.muted = false; } catch (_) {} }; } catch (_) {}
+      }
       this.applying = true;
+      this.writes++;
       try { p.v.playbackRate = p.rate; } catch (e) {}
+      this.silenceUntil = Date.now() + this.silenceMs;
+      this.verify(p.v);
+      if (muteUndo) raf(muteUndo);
       raf(() => { this.applying = false; });
       if (p.remember) this.remember(p.rate);
       if (!p.quiet) this.toastRate(p.rate, p.tag);
@@ -1157,15 +1527,22 @@ const DEFAULTS = {
       toast((tag ? tag + ' · ' : '') + '倍速 ' + rate + '×');
     },
     // 兼容旧调用点；返回「是否真的需要改」（写入是异步的，不能读回判断）
-    apply(v, r, remember, quiet) {
+    apply(v, r, remember, quiet, immediate) {
       if (!v) return false;
       const changed = Math.abs(v.playbackRate - (Number(r) || 1)) >= 0.001;
-      this.set(v, r, { remember: remember, quiet: quiet });
+      this.set(v, r, { remember: remember, quiet: quiet, immediate: !!immediate });
       return changed;
     },
     // ratechange 校正：只排一次下一帧，绝不连写
     correct(v) {
       if (!v || this.intent === null || this.applying) return;
+      /* v2.3.6：刚写完的 420ms 内一律不校正。
+         旧版在这里会因为 B 站的 ratechange 回调把 playbackRate 写成别的，
+         再 setTimeout 写回一次 —— 一次换档变成两次 300ms 冻结。 */
+      if (Date.now() < this.silenceUntil) { this.suppressed++; return; }
+      /* v2.3.6：合并窗口中目标已排队但还没写，此时 B 站的 ratechange 也会来；
+         若不挡，correct() 会按新 intent 提前写一次，把合并打散。 */
+      if (this.pending || this.debounce) { this.suppressed++; return; }
       if (CORE.officialHold && CORE.officialHold.active) return;
       /* v2.1.2 关键修复：旧版在这里写了 `if (touchRate.active) return`，
          把「触控期间被 B 站/其它脚本在 ratechange 回调里改回 1×」也一起放过，
@@ -1246,6 +1623,11 @@ const DEFAULTS = {
     return CORE.lastGestureAt > 0 && (Date.now() - CORE.lastGestureAt) < 1500;
   }
   function rememberVolume(val, src) {
+    /* v2.3.9：守卫期内 B 站会把 state.volume（如 0.5）写回 element.volume，
+       这次 volumechange 绝不能被记成「用户最后一次调整」，否则守卫撤后
+       applyPreferredVolume() 又拿 0.5 写回来 → 真机上的二次回弹。
+       只屏蔽 volumechange 来源；脚本自己的 syncPreferredVolume 直接赋值不受影响。 */
+    if (src === 'volumechange' && CORE.touchVolGuardActive) return false;
     if (!CFG.enabled || !CFG.rememberVolume) return false;
     const x = Math.min(1, Math.max(0, Number(val)));
     if (!isFinite(x) || Math.abs(x - Number(CFG.preferredVolume)) < 0.001) return false;
@@ -1299,7 +1681,13 @@ const DEFAULTS = {
   function restoreRate(v) {
     if (CORE.officialHold && CORE.officialHold.active) return;   // v1.7 铁律
     if (CORE.touchRate && CORE.touchRate.active) return;         // v2.1.0 手势期间让位
-    if (CFG.rateEnabled && CFG.rememberRate && Math.abs((CFG.rate || 1) - 1) > 0.001) Rate.apply(v, CFG.rate, false);
+    /* v2.3.6：刚换完档的静默期内，loadedmetadata / playing 等 6 个事件
+       再写回 CFG.rate 会多冻结一次；已经是目标档位时也完全不必写。 */
+    if (Date.now() < Rate.silenceUntil) { Rate.suppressed++; return; }
+    if (Rate.pending || Rate.debounce) { Rate.suppressed++; return; }  // 合并窗口内不抢写
+    const want = CFG.rate || 1;
+    if (v && Math.abs(v.playbackRate - want) < 0.001) return;
+    if (CFG.rateEnabled && CFG.rememberRate && Math.abs(want - 1) > 0.001) Rate.apply(v, want, false);
   }
   /* v1.7：统一的「回到 1× 原速」入口。关键是同时清掉 CFG.rate 记忆，
      否则下一次换视频 / playing / onMeta 时 restoreRate 又会把旧档位写回来。 */
@@ -1308,7 +1696,7 @@ const DEFAULTS = {
     const v = findVideo();
     if (!v) { CORE.rateDiag = { at: new Date().toLocaleTimeString('zh-CN', { hour12: false }), reason: why, result: '未找到视频', rememberedRate: 1 }; return false; }
     const before = v.playbackRate;
-    const changed = Rate.apply(v, 1, true, true);
+    const changed = Rate.apply(v, 1, true, true, true);
     CORE.rateDiag = {
       at: new Date().toLocaleTimeString('zh-CN', { hour12: false }), reason: why,
       before: before, after: 1, changed: changed, rememberedRate: 1
@@ -1348,10 +1736,10 @@ const DEFAULTS = {
     // 现在只写一次（Rate.set 会合并），再排一帧复核一次；配置只 save 一次。
     CFG.rate = 1; save();
     const v = curVideo || findVideo();
-    if (v) Rate.apply(v, 1, false, true);
+    if (v) Rate.apply(v, 1, false, true, true);
     raf(() => {
       const v2 = curVideo || findVideo();
-      if (v2 && Math.abs(v2.playbackRate - 1) > 0.001) Rate.apply(v2, 1, false, true);
+      if (v2 && Math.abs(v2.playbackRate - 1) > 0.001) Rate.apply(v2, 1, false, true, true);
     });
     toast(seen ? '↩︎ 松开右方向键 · 已回到 1× 原速' : '↩︎ 松开右方向键 · 已回到 1×（未检测到官方 3×）');
     LOG('Rate', '官方长按 3× 结束 → 回到 1× 原速（不恢复之前档位）· 检测到官方 3×=' + !!seen);
@@ -2024,19 +2412,21 @@ const DEFAULTS = {
     /* Apple 官方：iOS 上 playbackRate 可能不可写。写一次 2× 再读回，
        立刻还原、不存档、不提示 —— 诊断里如实给出 true/false/null。 */
     rateTest() {
+      /* v2.3.6：旧版「写 2× 再还原」= 2 次 300ms 帧冻结，而且 install 时会自动跑。
+         改成只读探测：检查 setter 描述符 + 现有写入记录，一次都不写。 */
       const C = CORE.dmClip;
       const v = curVideo || findVideo();
       if (!v) { C.rateWritable = null; return null; }
-      const before = v.playbackRate;
-      let ok = false;
+      let supported = false;
       try {
-        v.playbackRate = 2;
-        ok = Math.abs(v.playbackRate - 2) < 0.001;
-        v.playbackRate = before;
-      } catch (e) { ok = false; }
-      C.rateWritable = ok;
+        const proto = (typeof HTMLMediaElement !== 'undefined') ? HTMLMediaElement.prototype : null;
+        const d = proto && Object.getOwnPropertyDescriptor(proto, 'playbackRate');
+        supported = !!(d && d.set) || ('playbackRate' in v);
+      } catch (_) { supported = ('playbackRate' in v); }
+      C.rateWritable = supported ? (C.rateWritable !== false && Rate.writes > 0 ? true : null) : false;
       C.rateTestedAt = new Date().toLocaleTimeString('zh-CN', { hour12: false });
-      return ok;
+      C.rateProbeMode = 'no-write (v2.3.6)';
+      return C.rateWritable;
     },
 
     apply(why) {
@@ -2140,6 +2530,617 @@ const DEFAULTS = {
    *  ⑤ 不建顶层 tiles、不合成 click、短按完全不 preventDefault
    *     ⇒ B 站原生单击显隐工具栏 / 双击播放暂停完整保留（v2.2.0 成果）。
    * ============================================================ */
+  /* ============================================================
+     v2.3.10 · 白胶囊屏蔽 + 网页音量接管
+     ------------------------------------------------------------
+     用户判断：「那个白胶囊不是系统的，是 B 站的」—— 按这个判断做，
+     不再拿「系统层网页无权改」当挡箭牌。三层保证：
+       ① CSS（document 级，不是 shadow 内）：命中 B 站音量 HUD 候选类名，
+          任何时刻动态插入都立刻 display:none!important。
+       ② 扫描：单 Observer 复用重扫 + 手势窗口短轮询，按「类名或 🔊NN%
+          文案 + 在播放器附近 + 小尺寸浮层」补 CSS 选择器没覆盖的元素，
+          打 data-bpe-vol-hud-kill 并 inline 隐藏。我们自己的竖条在 shadow
+          root 里，document.querySelectorAll 天然扫不到，绝不会误伤。
+       ③ 接管：在 <video> 实例上定义 own volume 描述符，守卫窗口内吞掉
+          B 站 / 任何外部对 video.volume 的写入（不是事后纠正），从根上
+          接管网页音量。拿不到描述符才回退 v2.3.9 的 volumechange 守卫。
+     守卫期外：CSS 仍屏蔽 HUD（开关要求），但 volume 写入完全放行，
+     B 站音量滑块 / 系统侧键 / 控制中心照常。
+     ============================================================ */
+  /* ============================================================
+     v2.4.0 · 后台播放 / 画中画 / 控制中心（BgPlay）
+     ------------------------------------------------------------
+     三条能力，各自有独立的网页 API，互不依赖：
+       A. 自动小窗：visibilitychange / pagehide → 标准 requestPictureInPicture()
+          → 被拒回退 webkitSetPresentationMode('picture-in-picture')。
+       B. 系统媒体信息：MediaMetadata（标题 / UP 主 / 封面，多 sizes）。
+       C. 系统遥控：setActionHandler('play'|'pause'|'seekbackward'|
+          'seekforward'|'seekto') + playbackState + setPositionState。
+     不新增 keydown / keyup / MutationObserver：
+       · 手势预热复用 window 前置桥的 onUserGesture()
+       · 换视频 / 元数据刷新复用 scan() 与现有单 Observer 回调
+       · 可见性监听只绑一次（document visibilitychange + window pagehide）
+     只改 video 属性（playsinline / allowpictureinpicture / 移除
+     disablepictureinpicture），不动布局、不碰全屏 API、不拦任何事件。
+     ============================================================ */
+  const BgPlay = {
+    v: null, _visBound: false, _savedMeta: undefined, _boundHandlers: [],
+    _metaT: 0, _posT: 0, _lastMetaKey: '',
+    probe: {
+      supported: null, standard: false, webkitMode: false, pipEnabled: false,
+      supportsMode: null, autoPipAttr: null, disablePiP: null, playsInline: null,
+      mode: null, active: false, tries: 0, enters: 0, exits: 0,
+      lastError: null, lastReason: null, lastAt: 0,
+      hiddenEvents: 0, pagehideEvents: 0, visibleEvents: 0,
+      prewarm: 0, prewarmAt: 0, gestureAt: 0,
+      session: false, sessionError: null, metadata: null,
+      handlers: [], playbackState: null, positionUpdates: 0,
+      armedAttrs: null, returnExit: 0,
+      webkitCalled: 0, modeRequested: null, silentAttempts: 0,
+      autoBlocked: null, pausedAtHidden: null, srcKind: null,
+      pauseBeforeHidden: 0, pipBtnClicks: 0, nativePlayerAllowed: 0
+    },
+    cfg() {
+      return {
+        on: CFG.enabled !== false && CFG.bgPlay !== false,
+        auto: CFG.bgAutoPip !== false,
+        exitOnReturn: CFG.bgExitOnReturn === true,
+        session: CFG.bgMediaSession !== false,
+        metadata: CFG.bgMetadata !== false,
+        prewarm: CFG.bgPrewarm !== false,
+        pipButton: CFG.bgPipButton !== false,
+        nativePlayer: CFG.bgNativePlayer === true
+      };
+    },
+    isPip(v) {
+      try {
+        if (document.pictureInPictureElement === v) return true;
+        if (v && v.webkitPresentationMode === 'picture-in-picture') return true;
+      } catch (_) {}
+      return false;
+    },
+    /* 属性准备：B 站 video 一般已有 playsinline，但 iPad Safari 的 PiP 还常要
+       webkit-playsinline / allowpictureinpicture；disablepictureinpicture 属性
+       按社区实现只能 removeAttribute（JS 属性只读），不能赋值。 */
+    ensureAttrs(v) {
+      const P = this.probe;
+      if (!v) return false;
+      const before = [];
+      try {
+        if (!v.hasAttribute('playsinline')) { v.setAttribute('playsinline', ''); before.push('playsinline'); }
+        if (!v.hasAttribute('webkit-playsinline')) { v.setAttribute('webkit-playsinline', ''); before.push('webkit-playsinline'); }
+        if (!v.hasAttribute('allowpictureinpicture')) { v.setAttribute('allowpictureinpicture', ''); before.push('allowpictureinpicture'); }
+        if (v.hasAttribute('disablepictureinpicture')) { v.removeAttribute('disablepictureinpicture'); before.push('removed:disablepictureinpicture'); }
+        try { if ('autoPictureInPicture' in v) v.autoPictureInPicture = true; } catch (_) {}
+        P.armedAttrs = before;
+        P.playsInline = v.hasAttribute('playsinline') || v.hasAttribute('webkit-playsinline');
+        P.disablePiP = v.hasAttribute('disablepictureinpicture');
+        P.autoPipAttr = ('autoPictureInPicture' in v) ? !!v.autoPictureInPicture : null;
+        /* v2.4.1：B 站网页是 MSE / ManagedMediaSource 的 blob: 源，或原生 HLS。
+           行业口径：走 MSE 就等于放弃系统 PiP 管道（media-delivery.com），
+           原生 HLS 才走 Apple 的解码器与画中画路径。诊断如实标出来。 */
+        let src = ''; try { src = String(v.currentSrc || v.src || ''); } catch (_) {}
+        P.srcKind = /^blob:/.test(src) ? 'blob: (MSE / ManagedMediaSource，系统 PiP 管道受限)'
+          : /\.m3u8(\?|$)/i.test(src) ? 'HLS (原生，系统 PiP 友好)'
+          : /^https?:/.test(src) ? 'http 直链' : (src ? src.slice(0, 60) : '未知/未设置');
+      } catch (e) { P.lastError = 'ensureAttrs: ' + e.message; }
+      return true;
+    },
+    capability(v) {
+      const P = this.probe;
+      try {
+        P.standard = typeof v.requestPictureInPicture === 'function';
+        P.webkitMode = typeof v.webkitSetPresentationMode === 'function';
+        P.pipEnabled = !!document.pictureInPictureEnabled;
+        P.supportsMode = (typeof v.webkitSupportsPresentationMode === 'function')
+          ? !!v.webkitSupportsPresentationMode('picture-in-picture') : null;
+        P.mode = v.webkitPresentationMode || (document.pictureInPictureElement ? 'picture-in-picture' : 'inline');
+        P.supported = P.standard || P.webkitMode;
+        P.active = this.isPip(v);
+      } catch (e) { P.lastError = 'capability: ' + e.message; }
+      return P.supported;
+    },
+    /* 手势内预热：不进 PiP（不闪一下），只把属性 / autoPiP / Media Session
+       在还有 transient activation 的这一刻准备好。iOS 锁屏对 handler 注册
+       时机敏感（GitHub issue #25），所以也提前注册。 */
+    prewarm() {
+      const C = this.cfg(); if (!C.on || !C.prewarm) return;
+      const v = this.v || findVideo(); if (!v) return;
+      const P = this.probe;
+      P.prewarm++; P.prewarmAt = Date.now(); P.gestureAt = Date.now();
+      this.ensureAttrs(v);
+      this.capability(v);
+      if (C.session) this.bindSession(v);
+      /* 保留属性但不再当保证：Apple DTS 819235 明确 inline 播放态不认
+         autopictureinpicture，只有 fullscreen→后台才认。诊断 platform 会写清。 */
+      try { if ('autoPictureInPicture' in v) v.autoPictureInPicture = true; } catch (_) {}
+    },
+    install(v) {
+      if (!v) return false;
+      const C = this.cfg();
+      const isNew = this.v !== v;
+      this.v = v;
+      if (!C.on) return false;
+      this.ensureAttrs(v);
+      this.capability(v);
+      if (isNew && !v.__bpeBgBound) {
+        v.__bpeBgBound = true;
+        const self = this;
+        const state = () => { try { self.syncState(); } catch (_) {} };
+        ['play', 'pause', 'ended', 'loadedmetadata', 'ratechange'].forEach(t =>
+          v.addEventListener(t, state, { passive: true }));
+        v.addEventListener('timeupdate', () => {
+          try { self.setPosition(); } catch (_) {}
+          /* v2.4.1：B 站可能动态给 video 加 disablepictureinpicture 或清掉
+             autoPictureInPicture；复用 timeupdate 幂等补回，不新增定时器。 */
+          try { self.ensureAttrs(v); } catch (_) {}
+        }, { passive: true });
+        ['enterpictureinpicture', 'leavepictureinpicture', 'webkitpresentationmodechanged'].forEach(t =>
+          v.addEventListener(t, () => {
+            self.probe.active = self.isPip(v);
+            self.probe.mode = v.webkitPresentationMode || (document.pictureInPictureElement ? 'picture-in-picture' : 'inline');
+            LOG('BgPlay', '画中画状态变化 · ' + String(self.probe.mode) + ' · active=' + self.probe.active);
+            self.syncState();
+          }, { passive: true }));
+        LOG('BgPlay', '已绑定视频事件与 Media Session 同步');
+      }
+      if (!this._visBound) {
+        this._visBound = true;
+        const self = this;
+        document.addEventListener('visibilitychange', () => {
+          if (document.hidden) self.onHidden('visibilitychange');
+          else self.onVisible('visibilitychange');
+        }, { passive: true });
+        window.addEventListener('pagehide', () => self.onHidden('pagehide'), { passive: true });
+      }
+      if (C.session) this.bindSession(v);
+      this.updateMetadata();
+      this.syncState();
+      return true;
+    },
+    /* v2.4.1 · 只在【用户手势的同步栈】里才可能真的渲染出 PiP。
+       Apple DTS 819235：visibilitychange 里调 webkitSetPresentationMode 会
+       静默接受并派发事件，但窗口不渲染 —— 所以 hidden 路径一律不算成功。
+       注意本函数是 async，但 WebKit 路径放在第一个 await 之前，
+       调用方（按钮 click / Stay 菜单）仍在同步手势栈里。 */
+    async enter(reason) {
+      const C = this.cfg(); if (!C.on) return false;
+      const v = this.v || findVideo(); if (!v) { this.probe.lastError = '未找到视频'; return false; }
+      const P = this.probe;
+      this.ensureAttrs(v); this.capability(v);
+      P.tries++; P.lastReason = reason || 'enter'; P.lastAt = Date.now();
+      if (this.isPip(v)) { P.active = true; return true; }
+      const fromHidden = /切后台|visibilitychange|pagehide/.test(P.lastReason);
+      if (v.readyState < 2 || v.ended) {
+        P.lastError = '视频未就绪（readyState=' + v.readyState + ' ended=' + v.ended + '）';
+        LOG('BgPlay', '跳过建窗：' + P.lastError);
+        return false;
+      }
+      /* 用户主动点「⧉」时若视频暂停，同一个手势内同步恢复播放（是用户意图） */
+      if (v.paused && !fromHidden) { try { v.play(); } catch (_) {} }
+      /* ① Apple 官方自定义控件路径：同步、不 await —— 手势内最可靠 */
+      if (typeof v.webkitSetPresentationMode === 'function') {
+        try {
+          const ok = (typeof v.webkitSupportsPresentationMode === 'function')
+            ? v.webkitSupportsPresentationMode('picture-in-picture') : true;
+          if (!ok) throw new Error('webkitSupportsPresentationMode=false');
+          v.webkitSetPresentationMode('picture-in-picture');
+          P.webkitCalled++; P.modeRequested = 'picture-in-picture'; P.lastError = null;
+          if (fromHidden) {
+            /* ★ 静默接受 ≠ 渲染：明确记成「实验性无效尝试」，绝不计 enters */
+            P.silentAttempts++;
+            P.autoBlocked = 'WebKit 限制：inline 播放态在无用户交互时不渲染 PiP（Apple DTS 819235）';
+            LOG('BgPlay', '切后台尝试已记录为静默无效（不算成功）· 请用 ⧉ 手势内建窗');
+            return false;
+          }
+          P.enters++; P.active = true;
+          LOG('BgPlay', '✅ 手势内已建立画中画（' + P.lastReason + '）· 之后切走由系统继续');
+          return true;
+        } catch (e) {
+          P.lastError = 'webkit: ' + String((e && (e.message || e.name)) || e).slice(0, 90);
+        }
+      } else P.lastError = '无 webkitSetPresentationMode';
+      /* ② 标准 API：需要瞬态用户激活，只在手势内、且 WebKit 路径失败时试 */
+      if (typeof v.requestPictureInPicture === 'function' && !fromHidden) {
+        try {
+          await v.requestPictureInPicture();
+          P.enters++; P.active = true; P.lastError = null;
+          LOG('BgPlay', '✅ 标准 API 已建立画中画（' + P.lastReason + '）');
+          return true;
+        } catch (e) {
+          P.lastError = 'standard: ' + String((e && (e.name || e.message)) || e).slice(0, 90);
+        }
+      }
+      LOG('BgPlay', '⚠ 未能建立小窗：' + P.lastError);
+      if (!fromHidden) { try { toast('⚠ 未能建立小窗 · 看「📋 后台诊断」的 pip.lastError'); } catch (_) {} }
+      return false;
+    },
+    exit(reason) {
+      const v = this.v || findVideo(); if (!v) return false;
+      const P = this.probe;
+      let done = false;
+      try {
+        if (typeof document.exitPictureInPicture === 'function') { document.exitPictureInPicture(); done = true; }
+      } catch (_) {}
+      try {
+        if (typeof v.webkitSetPresentationMode === 'function') { v.webkitSetPresentationMode('inline'); done = true; }
+      } catch (_) {}
+      if (done) { P.exits++; P.active = false; P.lastReason = reason || 'exit'; LOG('BgPlay', '已退出画中画（' + P.lastReason + '）'); }
+      return done;
+    },
+    onHidden(reason) {
+      const C = this.cfg(); if (!C.on) return;
+      const P = this.probe;
+      if (reason === 'pagehide') P.pagehideEvents++; else P.hiddenEvents++;
+      const v = this.v || findVideo();
+      /* v2.4.0 的第二个 bug：iOS 切后台顺序是 pause → visibilitychange hidden
+         （Apple DTS 819235 实测），旧版 onHidden 一见 v.paused 就 return，
+         连尝试都没做。这里改成只记录证据，不再把 paused 当跳过理由。 */
+      P.pausedAtHidden = v ? !!v.paused : null;
+      if (v && v.paused) P.pauseBeforeHidden++;
+      if (v) { try { this.ensureAttrs(v); } catch (_) {} }
+      P.autoBlocked = 'WebKit 限制：playsinline(inline) 播放态无法在无用户交互时自动切 PiP（Apple DTS 819235）';
+      if (!C.auto) {
+        P.lastReason = reason + ': 停用自动 PiP（见 platform.autoPipFromInline）';
+        LOG('BgPlay', '切后台：不尝试自动 PiP · 请用 ⧉ 在手势内先建窗');
+        /* 音频交给 Media Session / 系统音频会话：用户已证实控制中心能续播，
+           脚本不主动 play() 抢用户意志，也不 pause。 */
+        try { this.syncState(); } catch (_) {}
+        return;
+      }
+      /* 实验开关：用户手动开才同步试一次，且明确不算成功 */
+      P.lastReason = reason + ': 切后台(实验)';
+      if (v && v.readyState >= 2 && !v.ended) this.enter(P.lastReason);
+    },
+    onVisible(reason) {
+      const C = this.cfg(); if (!C.on) return;
+      this.probe.visibleEvents++;
+      const v = this.v || findVideo();
+      if (!v) return;
+      this.capability(v); this.syncState();
+      if (C.exitOnReturn && this.isPip(v)) { this.probe.returnExit++; this.exit('回到页面'); }
+      /* 默认保持系统小窗：点小窗可返回网页，符合 iOS 原生行为 */
+    },
+    /* ---------------- Media Session ---------------- */
+    /* v2.4.0 自查：boot() 末尾的 applyCfg() 会先走 onCfgChange()→
+       updateMetadata()，那时 BgPlay.install() 还没跑、_savedMeta 还是
+       undefined。若只在 bindSession() 里保存原值，就会把我们【自己写的】
+       MediaMetadata 当成「B 站原值」，关开关时恢复不干净。
+       现在任何写 MS.metadata 之前都先过这个幂等快照。 */
+    snapshot() {
+      if (this._savedMeta !== undefined) return;
+      try { const MS = navigator.mediaSession; this._savedMeta = (MS && MS.metadata) || null; }
+      catch (_) { this._savedMeta = null; }
+    },
+    bindSession(v) {
+      /* v2.4.0 自查：总开关关闭时，scan() / render() 仍可能再走到这里；
+         没有这层守卫会把刚注销的 metadata / handlers 又写回去。 */
+      const C = this.cfg(); if (!C.on || !C.session) return;
+      const P = this.probe, MS = navigator.mediaSession;
+      if (!MS) { P.session = false; P.sessionError = 'navigator.mediaSession 不存在'; return; }
+      P.session = true; P.sessionError = null;
+      this.snapshot();
+      const self = this;
+      const set = (a, fn) => {
+        try {
+          MS.setActionHandler(a, fn);
+          if (P.handlers.indexOf(a) < 0) P.handlers.push(a);
+          self._boundHandlers.push(a);
+        } catch (e) { P.sessionError = a + ': ' + String((e && e.message) || e).slice(0, 60); }
+      };
+      /* 只注册 iOS 上确定有效的动作；prev/next 在 iOS 锁屏有已知 quirk，
+         而且会误切分 P，故意不注册。 */
+      set('play', () => { try { v.play().catch(() => {}); } catch (_) {} });
+      set('pause', () => { try { v.pause(); } catch (_) {} });
+      set('seekbackward', d => {
+        try { v.currentTime = Math.max(0, v.currentTime - ((d && d.seekOffset) || 10)); } catch (_) {}
+      });
+      set('seekforward', d => {
+        try { v.currentTime = Math.min(v.duration || 1e9, v.currentTime + ((d && d.seekOffset) || 10)); } catch (_) {}
+      });
+      set('seekto', d => {
+        try { if (d && isFinite(d.seekTime)) v.currentTime = d.seekTime; } catch (_) {}
+      });
+      if (C.metadata) this.updateMetadata(true);
+      this.syncState();
+    },
+    unbindSession() {
+      const MS = navigator.mediaSession; if (!MS) return;
+      this.snapshot();
+      const P = this.probe;
+      this._boundHandlers.forEach(a => { try { MS.setActionHandler(a, null); } catch (_) {} });
+      this._boundHandlers = []; P.handlers = [];
+      try { MS.metadata = this._savedMeta || null; } catch (_) {}
+      try { MS.playbackState = 'none'; } catch (_) {}
+      P.session = false; P.metadata = null; P.playbackState = null;
+      LOG('BgPlay', 'Media Session 已注销并恢复 B 站原 metadata');
+    },
+    syncState() {
+      const C = this.cfg(); if (!C.on || !C.session) return;
+      const MS = navigator.mediaSession, v = this.v || findVideo();
+      if (!MS || !v) return;
+      try {
+        MS.playbackState = (v.paused || v.ended) ? 'paused' : 'playing';
+        this.probe.playbackState = MS.playbackState;
+      } catch (e) { this.probe.sessionError = 'playbackState: ' + e.message; }
+      this.setPosition();
+    },
+    setPosition() {
+      const C = this.cfg(); if (!C.on || !C.session) return;
+      if (Date.now() - this._posT < 900) return;
+      this._posT = Date.now();
+      const MS = navigator.mediaSession, v = this.v || findVideo();
+      if (!MS || !v || typeof MS.setPositionState !== 'function') return;
+      try {
+        if (!isFinite(v.duration) || v.duration <= 0) return;
+        MS.setPositionState({ duration: v.duration, playbackRate: v.playbackRate || 1,
+          position: Math.min(v.duration, v.currentTime || 0) });
+        this.probe.positionUpdates++;
+      } catch (e) { /* seekto / positionState 在部分版本会抛，静默 */ }
+    },
+    absUrl(u) {
+      try { const x = String(u || '').trim(); if (!x) return '';
+        if (x.indexOf('//') === 0) return 'https:' + x;
+        if (x.indexOf('http') === 0) return x;
+        return new URL(x, location.href).href;
+      } catch (_) { return ''; }
+    },
+    /* 标题 / UP 主 / 封面：全部取自页面已有数据，不联网、不编造 */
+    readMeta() {
+      let title = '', artist = '', art = '';
+      try {
+        const st = window.__INITIAL_STATE__ || {};
+        const vd = st.videoData || st.videoInfo || {};
+        title = String(vd.title || '');
+        artist = String((vd.owner && vd.owner.name) || vd.author || '');
+        art = String(vd.pic || vd.cover || '');
+      } catch (_) {}
+      if (!title) { try { title = String(document.title || '').replace(/[_-]?哔哩哔哩.*$/i, '').replace(/_bilibili.*$/i, '').trim(); } catch (_) {} }
+      if (!artist) {
+        try { const el = document.querySelector('.up-name, .bpx-player-ctrl-up-name, [class*="up-name"]'); if (el) artist = String(el.textContent || '').trim(); } catch (_) {}
+      }
+      if (!art) {
+        try { const m = document.querySelector('meta[itemprop="image"], meta[property="og:image"]'); if (m) art = m.getAttribute('content') || ''; } catch (_) {}
+      }
+      return { title: title || '哔哩哔哩', artist: artist || 'BilibiliPlus Xi/Elio', art: this.absUrl(art) };
+    },
+    updateMetadata(force) {
+      const C = this.cfg(); if (!C.on || !C.session || !C.metadata) return;
+      if (!force && Date.now() - this._metaT < 500) return;
+      this._metaT = Date.now();
+      const MS = navigator.mediaSession, P = this.probe;
+      if (!MS || typeof window.MediaMetadata !== 'function') { P.sessionError = 'MediaMetadata 不存在'; return; }
+      this.snapshot();                       // 必须在写之前保存 B 站原值
+      const m = this.readMeta();
+      const key = m.title + '|' + m.artist + '|' + m.art;
+      if (key === this._lastMetaKey) return;
+      this._lastMetaKey = key;
+      try {
+        const artwork = m.art ? ['96x96', '256x256', '512x512'].map(sz => ({ src: m.art, sizes: sz, type: 'image/jpeg' })) : [];
+        MS.metadata = new window.MediaMetadata({ title: m.title, artist: m.artist,
+          album: 'BilibiliPlus Xi/Elio', artwork: artwork });
+        P.metadata = { title: m.title, artist: m.artist, artwork: m.art ? m.art.slice(0, 90) : null };
+      } catch (e) { P.sessionError = 'metadata: ' + e.message; }
+    },
+    onCfgChange() {
+      const C = this.cfg();
+      if (!C.on || !C.session) { this.unbindSession(); return; }
+      this.ensureAttrs(this.v || findVideo());
+      this.capability(this.v || findVideo());
+      if (this.v) this.bindSession(this.v);
+      this.updateMetadata(true);
+      this.syncState();
+    },
+    diag() {
+      const C = this.cfg(), P = this.probe, v = this.v || findVideo();
+      if (v) { this.ensureAttrs(v); this.capability(v); }
+      return {
+        checkedAt: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
+        version: CORE.version, enabled: C.on, cfg: C,
+        api: { standard: P.standard, webkitMode: P.webkitMode, pipEnabled: P.pipEnabled,
+          supportsMode: P.supportsMode, autoPipAttr: P.autoPipAttr,
+          disablePiP: P.disablePiP, playsInline: P.playsInline, armedAttrs: P.armedAttrs,
+          mode: P.mode, active: P.active, supported: P.supported },
+        pip: { tries: P.tries, enters: P.enters, exits: P.exits,
+          webkitCalled: P.webkitCalled, modeRequested: P.modeRequested,
+          silentAttempts: P.silentAttempts, autoBlocked: P.autoBlocked,
+          pausedAtHidden: P.pausedAtHidden, pauseBeforeHidden: P.pauseBeforeHidden,
+          srcKind: P.srcKind, pipBtnClicks: P.pipBtnClicks,
+          lastError: P.lastError, lastReason: P.lastReason, lastAt: P.lastAt,
+          hiddenEvents: P.hiddenEvents, pagehideEvents: P.pagehideEvents,
+          visibleEvents: P.visibleEvents, returnExit: P.returnExit },
+        platform: {
+          autoPipFromInline: '不可用：Apple DTS 819235 —— inline(playsinline) 无用户交互时不能自动切 PiP；autopictureinpicture 属性 inline 不认，只有 fullscreen→后台才认',
+          webkitSilentAccept: 'visibilitychange 里 webkitSetPresentationMode 不抛错、事件也派发，但 PiP 窗口不渲染（v2.4.0 误记为成功）',
+          eventOrder: 'iOS 切后台：pause → visibilitychange hidden（对应「退出 Safari 会自动暂停」）',
+          audioOnly: '控制中心 play 恢复的是音频会话，PiP 未渲染故只有声音（对应实机现象）',
+          mseNote: 'B 站网页走 MSE / ManagedMediaSource（blob: 源）；行业口径：走 MSE 即放弃系统 PiP 管道，原生 HLS 才走 Apple 解码器与画中画路径',
+          reliablePaths: [
+            'A（默认）⧉ 手势内建窗：画面角落按钮 / Stay 菜单，click 同步栈里调 webkitSetPresentationMode；建好后切网页、退出 Safari、切 App 都由系统继续',
+            'B（可选，默认关）恢复原生播放器：放开 webkitEnterFullscreen → AVPlayerViewController → 系统 fullscreen→后台自动 PiP；代价是该层网页收不到触摸，触控手势全失效'
+          ],
+          nativePlayerAllowed: C.nativePlayer, nativePlayerCalls: P.nativePlayerAllowed
+        },
+        prewarm: { count: P.prewarm, at: P.prewarmAt, lastGestureAt: P.gestureAt },
+        session: { available: P.session, error: P.sessionError, savedMeta: this._savedMeta ? '(已保存)' : String(this._savedMeta), handlers: P.handlers.slice(),
+          playbackState: P.playbackState, metadata: P.metadata, positionUpdates: P.positionUpdates },
+        video: v ? { readyState: v.readyState, paused: v.paused, ended: v.ended,
+          muted: v.muted, currentTime: Math.round(v.currentTime || 0), duration: Math.round(v.duration || 0) } : null,
+        visibility: { hidden: !!document.hidden, pipElement: !!(document.pictureInPictureElement) },
+        flagsToCheck: [
+          '系统：设置 → 通用 → 画中画 → 「自动开启画中画」开（不开则所有网页 PiP 都无效）',
+          'Safari 网站权限：地址栏 AA / 锁形 → 「画中画」→ 允许（按域名记忆）',
+          '设置 →  Safari → 高级 → Experimental Features：Media Session API 保持开；若有 Picture-in-Picture 相关项也开',
+          '改 Experimental Features 后关闭标签页重新打开才生效',
+          '视频需播过至少一帧、且未静音（静音媒体系统不显示 Now Playing 控件）',
+          'v2.4.1 更正：不要指望切后台那一刻自动小窗（WebKit 限制）；请先在页面内点 ⧉ 建立小窗，再切走',
+          '若坚持自动，可开「临时恢复原生播放器」：进 B 站原生全屏后切后台由系统自动 PiP，但网页触控手势会失效'
+        ],
+        note: 'PiP 成功即由系统层继续解码播放，网页 JS 挂起不影响；控制中心 play/pause 由 Media Session handler 驱动'
+      };
+    }
+  };
+
+  const VOL_HUD_CSS = [
+    '[data-bpe-vol-hud-kill],',
+    '.bpx-player-volume-hint,.bpx-player-volume-tip,.bpx-player-volume-toast,',
+    '.bpx-player-volume-hud,.bpx-player-volume-notice,.bpx-player-volume-indicator,',
+    '.bpx-player-volume-bubble,.bpx-player-mobile-volume-hint,',
+    '.bpx-player-ctrl-volume-hint,.bpx-player-video-volume-hint,',
+    '[class*="volume-hint"],[class*="volume-tip"],[class*="volume-toast"],',
+    '[class*="volume-hud"],[class*="volume-notice"],[class*="volume-indicator"],',
+    '[class*="volume-bubble"],[class*="volumeHint"],[class*="volumeTip"],',
+    '[class*="volumeToast"],[class*="volumeHud"]',
+    '{ display:none!important; visibility:hidden!important; opacity:0!important;',
+    '  pointer-events:none!important; }'
+  ].join('\n');
+  const VolHud = {
+    styleEl: null, _watchT: 0, _watchUntil: 0, _lastMoSweep: 0,
+    probe: null,
+    P() { if (!this.probe) this.probe = TouchV3.volHudProbe; return this.probe; },
+    cfg() { return { kill: CFG.touchKillVolHud !== false, own: CFG.touchOwnVolume !== false }; },
+    /* ① CSS 注入 / 撤销，开关即时生效 */
+    apply() {
+      const C = this.cfg(), P = this.P();
+      if (C.kill) {
+        if (!this.styleEl) {
+          try { this.styleEl = addStyle(VOL_HUD_CSS, 'bpe-vol-hud-css'); } catch (_) {}
+        }
+        P.cssInstalled = !!this.styleEl;
+        this.sweep('applyCfg');
+        this.startWatch(500);
+      } else {
+        if (this.styleEl) { try { this.styleEl.remove(); } catch (_) {} this.styleEl = null; }
+        P.cssInstalled = false;
+        /* 关开关：把扫描标记过的元素恢复显示 */
+        try {
+          (document.body.querySelectorAll('[data-bpe-vol-hud-kill]') || []).forEach(el => {
+            try {
+              el.style.removeProperty('display'); el.style.removeProperty('visibility');
+              el.style.removeProperty('pointer-events');
+              delete el.dataset.bpeVolHudKill;
+            } catch (_) {}
+          });
+        } catch (_) {}
+      }
+    },
+    /* ② 扫描：类名 / 文案 + 播放器附近 + 小浮层，三重限定防误伤 */
+    sweep(reason) {
+      const C = this.cfg(); if (!C.kill) return 0;
+      const P = this.P();
+      P.sweeps++; P.lastReason = reason || 'sweep'; P.lastSweepAt = Date.now();
+      let n = 0;
+      try {
+        const list = document.body ? document.body.querySelectorAll('div,span,section,p') : [];
+        for (let i = 0; i < list.length && i < 3000; i++) {
+          const el = list[i];
+          if (!el || (el.dataset && el.dataset.bpeVolHudKill)) continue;
+          let cls = ''; try { cls = String(el.className || ''); } catch (_) {}
+          if (cls.indexOf('bpe-') >= 0) continue;                 // 脚本自身元素一律跳过
+          let txt = ''; try { txt = String(el.textContent || '').trim(); } catch (_) {}
+          const byCls = /(?:volume|音量)[-_ ]?(?:hint|tip|toast|hud|notice|indicator|bubble|popup)/i.test(cls)
+                     || /(?:hint|tip|toast|hud|notice|indicator|bubble)[-_ ]?(?:volume|音量)/i.test(cls);
+          const byText = /^[🔊🔉🔈🔇\s]*\d{1,3}\s*%?\s*$/.test(txt) && txt.length <= 9;
+          if (!byCls && !byText) continue;
+          let near = false;
+          try {
+            near = !!(el.closest && el.closest('.bpx-player-video-wrap, .bpx-player-container, #bilibili-player'))
+                || el.parentElement === document.body;
+          } catch (_) {}
+          if (!near) continue;
+          let r = null; try { r = el.getBoundingClientRect(); } catch (_) {}
+          if (r && (r.width > 340 || r.height > 170 || r.width < 8 || r.height < 8)) continue;
+          try {
+            el.dataset.bpeVolHudKill = '1';
+            el.style.setProperty('display', 'none', 'important');
+            el.style.setProperty('visibility', 'hidden', 'important');
+            el.style.setProperty('pointer-events', 'none', 'important');
+            n++;
+            if (P.samples.length < 8) P.samples.push({ cls: cls.slice(0, 60), txt: txt.slice(0, 20), reason: P.lastReason });
+          } catch (_) {}
+        }
+      } catch (_) {}
+      P.killed += n;
+      return n;
+    },
+    /* 手势窗口内的短轮询：B 站 HUD 常在松手那一刻才动态插入 */
+    startWatch(ms) {
+      const C = this.cfg(); if (!C.kill) return;
+      const P = this.P(), self = this;
+      clearTimeout(this._watchT);
+      this._watchUntil = Date.now() + Math.max(200, ms || 900);
+      P.watchActive = true;
+      const tick = () => {
+        if (Date.now() >= self._watchUntil) { self._watchT = 0; P.watchActive = false; return; }
+        self.sweep('watch');
+        self._watchT = setTimeout(tick, 80);
+      };
+      tick();
+    },
+    /* 供单 Observer 回调复用，节流 120ms，不新增 Observer */
+    onMutation() {
+      const C = this.cfg(); if (!C.kill) return;
+      if (Date.now() - this._lastMoSweep < 120) return;
+      this._lastMoSweep = Date.now();
+      this.sweep('mutation');
+    },
+    /* ③ 直接在 <video> 实例上接管 volume 描述符。
+       守卫窗口内吞掉外部写入；脚本自身写入用 CORE.applyingVolume 放行。
+       HTMLMediaElement.prototype.volume 在 WebKit 是 configurable，
+       实例 own property 会遮蔽原型；只影响当前这一个 video，不污染全局。 */
+    own(v) {
+      const C = this.cfg(); if (!C.own || !v) return false;
+      if (v.__bpeVolOwned) return true;
+      let d = null;
+      try {
+        let proto = Object.getPrototypeOf(v), hop = 0;
+        while (proto && hop < 8 && !d) {
+          d = Object.getOwnPropertyDescriptor(proto, 'volume');
+          proto = Object.getPrototypeOf(proto); hop++;
+        }
+      } catch (_) {}
+      if (!d || !d.get || !d.set) { TouchV3.probe.ownFail = 'no volume descriptor on prototype chain'; return false; }
+      const self = this, ng = d.get, ns = d.set;
+      try {
+        Object.defineProperty(v, 'volume', {
+          configurable: true, enumerable: true,
+          get() { try { return ng.call(v); } catch (_) { return 1; } },
+          set(x) {
+            const num = Math.min(1, Math.max(0, Number(x) || 0));
+            /* 接管窗口由 v2.3.9 的守卫标记统一判定（拖期间 + 松手 900ms + pin） */
+            if (CORE.touchVolGuardActive && !CORE.applyingVolume) {
+              TouchV3.probe.volWritesBlocked++;
+              if (TouchV3.probe.volWriteAttempts.length < 12)
+                TouchV3.probe.volWriteAttempts.push(Math.round(num * 100));
+              return;                         // 吞掉 B 站 state 回写，直接接管
+            }
+            try { ns.call(v, num); } catch (_) {}
+          }
+        });
+        v.__bpeVolOwned = true;
+        TouchV3.probe.volumeOwned = true;
+        CORE.touchVolOwned = true;
+        LOG('Volume', 'v2.3.10：已在 video 实例层接管 volume 描述符（守卫窗口内屏蔽外部写入）');
+        return true;
+      } catch (e) {
+        TouchV3.probe.ownFail = String((e && e.message) || e).slice(0, 60);
+        return false;
+      }
+    },
+    diag() {
+      const P = this.P(), T = TouchV3.probe;
+      return {
+        cssInstalled: P.cssInstalled, cssId: P.cssId,
+        sweeps: P.sweeps, killed: P.killed, samples: P.samples.slice(),
+        lastReason: P.lastReason, watchActive: P.watchActive,
+        volumeOwned: T.volumeOwned, ownFail: T.ownFail,
+        volWritesBlocked: T.volWritesBlocked, volWriteAttempts: T.volWriteAttempts.slice(),
+        guardActive: !!CORE.touchVolGuardActive,
+        note: 'killed>0 ⇒ 白胶囊是 B 站 DOM，已隐藏；killed=0 且仍显示 ⇒ 才是系统层（网页层无法隐藏），但 element 音量仍由我们接管'
+      };
+    }
+  };
+
   const TouchV3 = {
     root: null, session: null, _hudT: 0,
     probe: { events: 0, starts: 0, startsRejected: 0, moves: 0, ends: 0, prevented: 0,
@@ -2149,8 +3150,16 @@ const DEFAULTS = {
       brightPct: null, volumePct: null, lastHud: null,
       endVia: null, noButtonMoves: 0, dupSkipped: 0, leakedCleaned: 0,
       endReleased: 0, endBlocked: 0, hudKind: null, rateText: null,
-      rateIdx0: null, lockDist: null, stepDist: null, levelVisible: false,
-      globalGuard: false, rootSel: null, lastAt: null },
+      rateIdx0: null, rateCap: 6, lockDist: null, stepDist: null, levelVisible: false,
+      globalGuard: false, rootSel: null, lastAt: null,
+      axis: null, lastAxis: null, axisPx: null, slideScale: null, hudSec: null,
+      seekPass: 0, ambiguous: 0, axisFlipBlocked: 0, rateHudAutoHide: 0,
+      nativeEndNeutralized: 0, cleanEndDispatched: 0, placeSkipped: 0,
+      volGuardWrites: 0, volGuardChecks: 0, volAfterRelease: null,
+      volPrefSynced: 0, volGuardUntil: 0, volTarget: null,
+      volWritesBlocked: 0, volWriteAttempts: [], volumeOwned: false, ownFail: null },
+    volHudProbe: { sweeps: 0, killed: 0, cssInstalled: false, cssId: 'bpe-vol-hud-css',
+      samples: [], lastReason: null, lastSweepAt: 0, watchActive: false },
     clamp(x, a, b, d) { const n = Number(x); return isFinite(n) ? Math.max(a, Math.min(b, n)) : d; },
     cfg() {
       let rates = CFG.touchV3Rates;
@@ -2163,8 +3172,102 @@ const DEFAULTS = {
         rates: rates.map(Number).filter(isFinite),
         bright: CFG.touchBrightVolume !== false,
         blockNative: CFG.touchBlockNative !== false,
-        releaseEnd: CFG.touchReleaseEnd !== false
+        releaseEnd: CFG.touchReleaseEnd !== false,
+        /* v2.3.7 · 轴向锁定参数 */
+        axisPx: this.clamp(CFG.touchAxisPx, 12, 80, 28),
+        axisRatio: this.clamp(CFG.touchAxisRatio, 1.05, 3, 1.35),
+        slideScale: this.clamp(CFG.touchSlideScale, 160, 900, 420),
+        hudSec: this.clamp(CFG.touchHudSec, 1, 10, 3),
+        seekPass: CFG.touchSeekPass !== false,
+        neutralizeEnd: CFG.touchNeutralizeNativeEnd !== false,
+        volHold: CFG.touchVolumeHold !== false,
+        volHoldMs: this.clamp(CFG.touchVolumeHoldMs, 200, 3000, 900),
+        volPin: CFG.touchVolumePin === true,
+        /* v2.3.10 */
+        killHud: CFG.touchKillVolHud !== false,
+        ownVolume: CFG.touchOwnVolume !== false
       };
+    },
+    /* ============================================================
+       v2.3.9 · 音量巩固守卫（解决「松手弹回系统音量」）
+       两层音量必须分清：
+         系统音量（白底 🔊 HUD，侧键/控制中心）  ×  element.volume（我们写的）
+         = 实际听到的音量
+       我们只管 element.volume，从不碰、也无权改系统那一层的数字。
+       B 站播放器有自己的 state.volume（初始 0.5），松手结算时会写回
+       video.volume，把我们刚写的 0.2 覆盖掉 → 用户看到的「弹回 50%」。
+       守卫：拖期间不断续期；松手后再钉 volHoldMs（默认 900ms），
+       期间任何 volumechange 若偏离目标就立刻写回；并把
+       CFG.preferredVolume 同步成目标，避免守卫撤后 applyPreferredVolume
+       又拿旧记忆值写回来。守卫期外完全放行，B 站滑块/系统侧键照常。
+       ============================================================ */
+    volGuard: null, _volGuardBound: null, _volCheckT: [], _prefSaveT: 0, _volGuardFlagT: 0,
+    syncPreferredVolume(target) {
+      try {
+        if (Math.abs(Number(CFG.preferredVolume) - target) < 0.001) return;
+        CFG.preferredVolume = target;
+        CORE.volDiag = Object.assign({}, CORE.volDiag || {}, {
+          savedAt: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
+          savedValue: target, source: 'touchV3 (v2.3.9 巩固)', settable: true
+        });
+        clearTimeout(this._prefSaveT);
+        this._prefSaveT = setTimeout(() => { try { save(); } catch (_) {} }, 220);
+        this.probe.volPrefSynced++;
+      } catch (_) {}
+    },
+    startVolGuard(target, ms, pin) {
+      /* 守卫期内屏蔽记忆监听器；每帧调用会不断续期，松手后自然到期 */
+      CORE.touchVolGuardActive = true;
+      clearTimeout(this._volGuardFlagT);
+      if (!pin) {
+        const self = this;
+        this._volGuardFlagT = setTimeout(() => {
+          CORE.touchVolGuardActive = false;
+          self.volGuard = null;
+        }, ms + 20);
+      }
+      this.volGuard = { target: target,
+        until: pin ? Number.MAX_SAFE_INTEGER : (Date.now() + ms), pin: !!pin };
+      this.probe.volTarget = target;
+      this.probe.volGuardUntil = this.volGuard.until;
+      this.syncPreferredVolume(target);
+    },
+    /* volumechange 回调：只拦「被别人改回」，绝不拦已等于目标的值，
+       也不会递归（写回后偏离为 0）。写入用 applyingVolume 包住，
+       不污染 v1.6.3 的音量记忆监听器。 */
+    onVolumeChange() {
+      const g = this.volGuard;
+      if (!g || Date.now() >= g.until) { if (g && !g.pin) this.volGuard = null; return; }
+      const v = this.video(); if (!v) return;
+      let cur = 1;
+      try { cur = Number(v.volume); } catch (_) { return; }
+      if (Math.abs(cur - g.target) <= 0.01) return;
+      CORE.applyingVolume = true;
+      try { v.volume = g.target; } catch (_) {}
+      setTimeout(() => { CORE.applyingVolume = false; }, 0);
+      this.probe.volGuardWrites++;
+      this.probe.volAfterRelease = cur;       // 记下「被谁改成了多少」
+      LOG('Volume', '巩固守卫：检测到回写 ' + Math.round(cur * 100) + '% → 已写回 ' + Math.round(g.target * 100) + '%');
+    },
+    /* 松手后幂等复查：覆盖 B 站延迟/防抖回写（用户说「保持一会儿才有概率成功」）。
+       只在确实偏离时才写，值没变一次都不写，不会制造 volumechange 风暴。 */
+    scheduleVolChecks(ms) {
+      const self = this;
+      this._volCheckT.forEach(t => clearTimeout(t)); this._volCheckT = [];
+      [0, 120, 300, 600, Math.max(700, Math.round(ms * 0.9))].forEach(delay => {
+        self._volCheckT.push(setTimeout(() => {
+          const g = self.volGuard; if (!g || Date.now() >= g.until) return;
+          const v = self.video(); if (!v) return;
+          let cur = 1; try { cur = Number(v.volume); } catch (_) { return; }
+          self.probe.volGuardChecks++;
+          if (Math.abs(cur - g.target) <= 0.01) return;
+          CORE.applyingVolume = true;
+          try { v.volume = g.target; } catch (_) {}
+          setTimeout(() => { CORE.applyingVolume = false; }, 0);
+          self.probe.volGuardWrites++;
+          self.probe.volAfterRelease = cur;
+        }, delay));
+      });
     },
     findRoot() {
       const v = curVideo || findVideo();
@@ -2216,7 +3319,7 @@ const DEFAULTS = {
     },
     video() { return curVideo || findVideo(); },
     rateNow() { const v = this.video(); return v ? v.playbackRate : 1; },
-    writeRate(r) {
+    writeRate(r, immediate) {
       const v = this.video(); if (!v) return false;
       const before = v.playbackRate;
       /* ============================================================
@@ -2237,27 +3340,30 @@ const DEFAULTS = {
         Rate.intent = r;
         CORE.touchRate = { active: true, session: 'touchV3', rate: r };
       } catch (_) {}
-      try { v.playbackRate = r; } catch (e) { this.probe.rateWritable = false; return false; }
-      const ok = Math.abs(v.playbackRate - r) < 0.01;
-      if (this.probe.rateWritable === null || ok) this.probe.rateWritable = ok;
-      if (!ok && Math.abs(before - v.playbackRate) > 0.01) { try { v.playbackRate = before; } catch (_) {} }
-      if (!ok) {
-        // 资料冲突时的兜底：走 B 站自己的倍速菜单（站点在用户手势链内有权限）
-        const sel = '.bpx-player-ctrl-playbackrate-menu-item[data-value="' + r + '"],' +
-          'li[data-value="' + r + '"][class*="playbackrate"],[data-value="' + r + '"][class*="playbackrate"]';
-        const el = firstMatch([sel]);
-        if (el) { try { el.click(); return true; } catch (_) {} }
-      }
-      return ok;
+      /* v2.3.6：不再同步直写、不再失败回滚写（回滚又是一次 300ms 冻结），
+         也不再走 B 站倍速菜单兜底。统一交给 Rate 闸门：短窗口内连续跨档
+         只写最后一次，HUD 仍逐档即时提示，intent 已同步不会被 correct 拉回。 */
+      /* 长按进入 / 松手结算必须立刻写（否则 280ms 长按 + 160ms 合并
+         = 440ms 才有反应，会被当成「长按没用」）；只有上滑连续跨档
+         才进合并窗口，把多次跨档压成最后一次写。 */
+      Rate.set(v, r, { quiet: true, immediate: !!immediate, tag: 'touchV3' });
+      LOG('Rate', 'TouchV3 ' + (immediate ? '立即写 ' : '合并排队 ') + r + '×');
+      return true;
     },
     probeRates() {
+      /* v2.3.6：旧版每次「📋 触控诊断」都连写 4 档 + 还原 = 5 次帧冻结（≈1.5s 卡顿）。
+         改成只读探测，一次都不写；acceptedRates 直接给档位表并标注未实测。 */
       const v = this.video(); if (!v) return null;
-      const before = v.playbackRate, out = [];
-      this.cfg().rates.forEach(r => {
-        try { v.playbackRate = r; if (Math.abs(v.playbackRate - r) < 0.01) out.push(r); } catch (e) {}
-      });
-      try { v.playbackRate = before; } catch (_) {}
-      this.probe.acceptedRates = out; this.probe.rateWritable = out.length > 0;
+      let supported = false;
+      try {
+        const proto = (typeof HTMLMediaElement !== 'undefined') ? HTMLMediaElement.prototype : null;
+        const d = proto && Object.getOwnPropertyDescriptor(proto, 'playbackRate');
+        supported = !!(d && d.set) || ('playbackRate' in v);
+      } catch (_) { supported = ('playbackRate' in v); }
+      const out = (Array.isArray(CFG.rateList) ? CFG.rateList : this.cfg().rates).slice();
+      this.probe.acceptedRates = out;
+      this.probe.rateWritable = supported ? (this.probe.rateWritable !== false) : false;
+      this.probe.rateProbeMode = 'no-write (v2.3.6，档位表未逐档实测)';
       return out;
     },
     hud(main, sub, pct, side) {
@@ -2302,6 +3408,13 @@ const DEFAULTS = {
     place() {
       if (!sr) return;
       const g = this.geom(), q = s => sr.querySelector(s);
+      /* v2.3.8 · 每次 showLevel / showRate 都重写 3 个元素的 cssText，
+         连续 move 时是纯浪费且会打断布局；几何没变就跳过。 */
+      const r0 = g.r;
+      const key = (g.full ? 'F' : 'I') + '|' + g.W + '|' + g.Hh + '|' +
+        (r0 ? [r0.left, r0.top, r0.width, r0.height].map(n => Math.round(n)).join(',') : '-');
+      if (key === this._placeKey) { this.probe.placeSkipped++; return; }
+      this._placeKey = key;
       const B = q('.bpe-tv-bright'), V = q('.bpe-tv-vol'), T = q('.bpe-tv-rate');
       try {
         if (g.full) {
@@ -2337,18 +3450,30 @@ const DEFAULTS = {
         h.classList.add('on');
       } catch (_) {}
     },
-    /* 倍速轻提示：只有一行字，无进度条，低可见度 */
-    showRate(text) {
+    /* 倍速轻提示：只有一行字，无进度条，低可见度。
+       v2.3.7 · 「长按就显示 ×多少倍速中，显示三秒」：
+       sec 秒后自动收起（默认 3，来自 CFG.touchHudSec）；
+       换档时重新计时；松手由 hideGesture() 立刻收起，优先于定时器。 */
+    showRate(text, sec) {
       try { this.probe.lastHud = { main: text, side: 'center' };
         this.probe.hudKind = 'rate'; this.probe.rateText = text; } catch (_) {}
       if (!sr) return;
       const h = sr.querySelector('.bpe-tv-rate'); if (!h) return;
       this.place();
       try { h.textContent = text; h.classList.add('on'); } catch (_) {}
+      clearTimeout(this._rateHideT);
+      const ms = Math.max(1000, Math.min(10000, (Number(sec) || this.cfg().hudSec || 3) * 1000));
+      this.probe.hudSec = ms / 1000;
+      const self = this;
+      this._rateHideT = setTimeout(() => {
+        self._rateHideT = 0;
+        try { h.classList.remove('on'); self.probe.rateHudAutoHide++; } catch (_) {}
+      }, ms);
     },
     /* 松手 / 松鼠标立刻消失：直接关 display，不等任何淡出定时器 */
     hideGesture() {
       this.probe.levelVisible = false;
+      clearTimeout(this._rateHideT); this._rateHideT = 0;
       if (!sr) return;
       try {
         ['.bpe-tv-bright', '.bpe-tv-vol', '.bpe-tv-rate'].forEach(q => {
@@ -2370,9 +3495,12 @@ const DEFAULTS = {
       this.showLevel('bright', (val - 0.4) / 1.4, val);
     },
     /* v2.3.2 · 新音量档位：右半屏上下滑，带百分比 HUD。
-       iPad Safari 的 video.volume 多为只读恒 1；能写就写并回读验证，
-       不能写就如实标「网页音量档位」，不冒充系统音量。 */
+       v2.3.9 更正：旧注释「iPad Safari 的 video.volume 只读恒 1」不成立，
+       用户实机确认可写且真的能控制音量。现在写入后回读验证，
+       并交给音量巩固守卫防止松手被 B 站 state 回写覆盖。
+       这是【网页 element 音量】，不等于系统音量（白底 HUD 那一层）。 */
     volume(delta) {
+      const C = this.cfg();
       const cur = this.clamp(Number(CFG.touchVolume), 0, 1, 0.8);
       const val = this.clamp(cur + delta, 0, 1, 0.8);
       CFG.touchVolume = val;
@@ -2380,9 +3508,26 @@ const DEFAULTS = {
       this._volSaveT = setTimeout(() => { try { save(); } catch (_) {} }, 220);
       const v = this.video(); let writable = null;
       if (v) {
+        /* v2.3.10：懒接管（SPA 换 video 时 install() 会提前 return） */
+        try { VolHud.own(v); } catch (_) {}
+        try { VolHud.sweep('drag'); } catch (_) {}
+        /* v2.3.9：懒绑定 —— install() 在 root 未变化时会提前 return，
+           SPA 换 <video> 元素后仍要保证新元素上有守卫。 */
+        if (!v.__bpeVolGuardBound) {
+          v.__bpeVolGuardBound = true;
+          const self = this;
+          v.addEventListener('volumechange', () => self.onVolumeChange(), { passive: true });
+        }
+        /* v2.3.9：脚本写入必须屏蔽，否则 v1.6.3 的 volumechange 记忆监听器
+           会把「自己写的 20%」再记一遍，且守卫会被误判成外部回写。 */
+        CORE.applyingVolume = true;
         try { v.volume = val; writable = Math.abs(v.volume - val) < 0.01; }
         catch (_) { writable = false; }
+        setTimeout(() => { CORE.applyingVolume = false; }, 0);
       }
+      /* 拖期间每帧续期，松手时再由 finish() 从那一刻重新计时 */
+      if (C.volHold) this.startVolGuard(val, C.volHoldMs, C.volPin);
+      else if (this.volGuard) this.volGuard = null;
       this.probe.volumeWritable = writable;
       const pct = Math.round(val * 100);
       this.probe.volumePct = pct;
@@ -2393,6 +3538,8 @@ const DEFAULTS = {
        挡不住 B 站自己注册的 touch 手势识别器（它正是「滑左侧连音量一起调」
        「长按下滑变调音量」的来源）。捕获阶段 + stopImmediatePropagation
        才能让它收不到这一批 move/end。短按完全放行，click / dblclick 保留。 */
+    /* v2.3.7 注意：只在【垂直】手势（倍速 / 亮度 / 音量）调用。
+       水平手势整批放行给 B 站原生 seek，绝不调本函数。 */
     blockNative(e, active, P) {
       if (!active || this.cfg().blockNative === false) return false;
       let n = 0;
@@ -2416,7 +3563,7 @@ const DEFAULTS = {
       const locked = Number(CFG.touchLockRate) || 0;
       s.wasLocked = locked;                 // 记住进入长按前是否已锁定（滑动中会改写 CFG）
       const target = locked ? 1 : (C.rates.indexOf(2) >= 0 ? 2 : C.rates[C.rates.length - 1]);
-      const ok = this.writeRate(target);
+      const ok = this.writeRate(target, true);
       s.rate = target;
       /* v2.3.5 · 「上滑无法升高档位」的真因：
          旧版拿 C.rates（touchV3Rates，只有 [0.5,1,1.5,2]）算档位，
@@ -2424,9 +3571,14 @@ const DEFAULTS = {
          clamp 回 2×，上滑一档都升不了。
          改用全局档位表 CFG.rateList（0.5~5 共 11 档），并固定基准 idx0
          —— 旧版用「会变的 s.rate」做 indexOf 基准，steps=2 时会连跳两档。 */
+      /* v2.5.0：键盘走完整 41 档（到 32×），但触控长按 / 上滑最高只到 6×
+         —— 用户明确要求。从全局表实时过滤，不另存一份会漂移的副本。 */
+      const cap = Math.max(2, Number(CFG.touchRateCap) || 6);
       const list = (Array.isArray(CFG.rateList) && CFG.rateList.length)
-        ? CFG.rateList.map(Number).filter(isFinite) : [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.5, 3, 4, 5];
+        ? CFG.rateList.map(Number).filter(x => isFinite(x) && x >= 1 && x <= cap)
+        : [1, 1.25, 1.5, 1.75, 2, 2.5, 3, 3.5, 4, 5, 6];
       s.rateList = list;
+      this.probe.rateCap = cap;
       s.rateIdx0 = list.indexOf(target);
       if (s.rateIdx0 < 0) {
         let best = 0;
@@ -2435,13 +3587,16 @@ const DEFAULTS = {
         s.rateIdx0 = best;
       }
       this.probe.rateIdx0 = s.rateIdx0;
-      /* v2.3.5 · 长按本身不显示任何 HUD（不要「几倍速 + 上下划」大段提示，
-         也不要进度条）。只在【上滑变档】或【下滑】后才给一行轻提示。 */
-      if (!ok) this.showRate('⚠ 倍速未写入');
-      LOG('TouchV3', '长按 → ' + target + '× · 写入' + (ok ? '成功' : '未生效'));
+      /* v2.3.7 · 改回「长按就显示」，但按你这轮的文案：
+         只有一行「2×倍速中」，无上下划说明、无进度条，显示 3 秒；
+         按住到 lockSec（默认 10s）才自动锁定，两者互不冲突。 */
+      s.axis = 'v';                       // 长按即锁死垂直轴，之后横向偏移也不切模式
+      this.showRate(ok ? (target + '×倍速中') : '⚠ 倍速未写入', C.hudSec);
+      LOG('TouchV3', '长按 → ' + target + '×倍速中 · 提示 ' + C.hudSec + 's · 自动锁定 ' + C.lockSec + 's');
     },
     start(s, C) { /* 占位：逻辑在 on() 内，保留便于诊断 */ },
     on(t, e) {
+      if (e && e.__bpeCleanEnd) return;       // v2.3.8：自己派给 B 站的净化 end
       const C = this.cfg(); if (!C.on) return;
       const P = this.probe; P.events++; P.lastAt = Date.now();
       const isStart = t === 'pointerdown' || t === 'touchstart';
@@ -2450,6 +3605,7 @@ const DEFAULTS = {
       const pt = this.point(e);
       if (isStart) {
         const v = this.video();
+        if (CFG.bgNativePlayer === true) return;   // v2.4.1：原生播放器模式不自动退出
         if (v && v.webkitPresentationMode === 'fullscreen') {
           P.presentationMode = 'fullscreen'; P.lastReject = '原生播放器全屏（网页收不到触摸）'; return;
         }
@@ -2470,15 +3626,30 @@ const DEFAULTS = {
         }
         const s = { x: pt.x, y: pt.y, t: Date.now(), mode: null, moved: false,
           locked: false, stepped: 0, slideDown: null, wasLocked: 0,
-          rateList: null, rateIdx0: 0,
+          rateList: null, rateIdx0: 0, axis: null,
           src: t.indexOf('touch') === 0 ? 'touch' : 'pointer' };
         this.session = s; P.starts++; P.lastReject = null;
+        /* v2.3.8：新手势一开始，上一条手势的「兼容 end 净化窗口」立刻作废，
+           否则用户松手后马上再点一下画面，那次单击的 up 会被误净化。 */
+        this.cleanEndUntil = 0;
+        /* v2.3.9：非 pin 模式下，过期守卫在新手势开始时清掉；
+           pin 模式（用户可选）保留到下次手势开始才撤，便于诊断。 */
+        if (this.volGuard && !this.volGuard.pin && Date.now() >= this.volGuard.until) this.volGuard = null;
+        /* v2.3.9 自查：用户关掉「持续钉住」后，下次手势必须撤掉旧 pin 守卫，
+           否则 touchVolGuardActive 会永久为 true，音量记忆从此不再记录。 */
+        if (!C.volPin && this.volGuard && this.volGuard.pin) this.volGuard = null;
+        if (!C.volPin && !this.volGuard) {
+          CORE.touchVolGuardActive = false;
+          clearTimeout(this._volGuardFlagT);
+        }
+        P.axis = null;                       // v2.3.7：每次新手势清空定轴，诊断才准
         const self = this;
         s.holdTimer = setTimeout(() => self.enterHold(s, C), C.holdMs);
         s.lockTimer = setTimeout(() => {
           if (s.mode === 'rate' && !s.locked) {
             s.locked = true; CFG.touchLockRate = s.rate; save();
-            self.showRate('🔒 ' + s.rate + '×');
+            /* v2.3.7 · 默认按住 10 秒才走到这里；提示仍只显示 3 秒 */
+            self.showRate('🔒 ' + s.rate + '×倍速中', C.hudSec);
           }
         }, C.lockSec * 1000);
         return;
@@ -2488,16 +3659,32 @@ const DEFAULTS = {
         if (s.lastEvent === e) { P.dupSkipped++; return; }   // 同一事件只结算一次
         s.lastEvent = e;
         P.moves++;
+        /* ============================================================
+           v2.3.7 · 轴向锁定（你这轮的核心要求）
+           「左右滑屏幕不能调进度了？」—— 是的，v2.3.2 起脚本对【所有】
+           手势激活后的 move 调了 stopImmediatePropagation()，B 站自己的
+           水平 seek 识别器一个 move 都收不到，进度条自然不动。
+           「别左右滑手稍微偏上偏下就调开亮度音量」—— 旧版只要
+           |dy|>10 或 |dx|>10 就 s.moved=true，随即按 x 左右分屏进
+           bright/volume；手指水平滑时轻微上下抖动就误判成调亮度。
+           「要调啥就调啥，松手之前不能调别的」—— 现在按下后先定轴，
+           一旦定为 h / v 就写进 s.axis，直到松手都不再改变：
+             · h（水平）→ 整批 move 完全放行给 B 站原生进度手势，
+               脚本不碰 currentTime、不 preventDefault、不 stopPropagation
+             · v（垂直）→ 独占 move（掐掉 B 站原生音量 HUD），
+               按起点 x 左/右分画面亮度 / 新音量档位
+             · 长按进 rate → 直接锁死 v，横移也不切
+           定轴条件：主轴位移 >= axisPx(默认 28) 且 主轴 > 副轴 × ratio(1.35)。
+           未定轴的微小抖动 / 斜向模糊一律放行，短按 click 完全不受影响。
+           ============================================================ */
         const dy = s.y - pt.y, dx = pt.x - s.x;
-        if (Math.abs(dy) > 10 || Math.abs(dx) > 10) s.moved = true;
-        // 关键：判定成立后的【第一个】move 就独占（WebKit 要求第一个 move 就拦）。
-        // 短按 / 未达阈值的微小抖动一律放行 → 原生 click / dblclick 完整保留。
-        const active = !!(s.mode || s.moved || Date.now() - s.t >= C.holdMs);
-        /* 未激活 = 短按或微小抖动：连 preventDefault 都不调。
-           滚动已由 .bpe-tv3 的 touch-action:none 挡住（真机诊断 computed 已确认生效），
-           这里再拦反而会抑制浏览器合成 click，伤到单击 / 双击。 */
-        this.blockNative(e, active, P);
+        const adx = Math.abs(dx), ady = Math.abs(dy);
+        P.axisPx = C.axisPx; P.slideScale = C.slideScale; P.hudSec = C.hudSec;
+
         if (s.mode === 'rate') {
+          /* 长按倍速：垂直轴锁死；后续任何横向偏移都不改成 seek */
+          if (s.axis !== 'v') s.axis = 'v';
+          this.blockNative(e, true, P);
           if (s.slideDown) return;          // 下滑已锁定/解除，后续回摆不再改档
           /* v2.3.5 · 阈值按画幅比例，不再用固定 44px。
              「锁定检测太灵敏，起码 1/5 画面行程」→ lockDist = 画面高 / 5；
@@ -2513,8 +3700,8 @@ const DEFAULTS = {
             if (dyDown > lockDist) {
               s.slideDown = 'unlock';
               CFG.touchLockRate = 0; save();
-              this.writeRate(1);
-              this.showRate('松开还原倍速');
+              this.writeRate(1, true);
+              this.showRate('松开还原倍速', C.hudSec);
             }
           } else {
             /* 未锁定长按：上滑 = 每跨一档提示「×多少」，下滑 = 锁定倍速 */
@@ -2525,28 +3712,132 @@ const DEFAULTS = {
               const idx = Math.max(0, Math.min(list.length - 1, s.rateIdx0 + steps));
               const r = list[idx];
               const ok = this.writeRate(r); s.rate = r;
-              this.showRate(r + '×');
+              /* v2.3.7 · 换档时再显示一下「×多少倍速中」，重新计时 3 秒 */
+              this.showRate(ok === false ? '⚠ 倍速未写入' : (r + '×倍速中'), C.hudSec);
             }
             if (dyDown > lockDist) {
               s.slideDown = 'lock';
               CFG.touchLockRate = s.rate; save();
-              this.showRate('松开锁定倍速');
+              this.showRate('松开锁定倍速', C.hudSec);
             }
           }
           return;
         }
-        if (!s.mode && s.moved && C.bright) {
-          s.mode = pt.x < window.innerWidth / 2 ? 'bright' : 'volume';
-          /* v2.3.1：基线必须取 touchstart 的 y，不是「判定成立那一次 move」的 y。
-             旧写法让第一下滑动的位移被吃掉（s.lastY === pt.y → delta=0），
-             亮度/音量永远停在初始值，看起来像「滑了没反应」。 */
-          s.lastY = s.y;
+
+        /* ① 尚未定轴：先判方向，未达阈值 / 斜向模糊一律放行（连拦都不拦） */
+        if (!s.axis) {
+          if (adx < C.axisPx && ady < C.axisPx) return;       // 微小抖动
+          if (adx >= C.axisPx && adx > ady * C.axisRatio) {
+            s.axis = 'h'; s.mode = 'seek';
+            P.axis = 'h';
+          } else if (ady >= C.axisPx && ady > adx * C.axisRatio) {
+            s.axis = 'v'; P.axis = 'v';
+          } else {
+            P.ambiguous++; return;                           // 斜向：继续等，不拦
+          }
+        } else {
+          P.axis = s.axis;
         }
-        if (s.mode === 'bright') { this.bright((s.lastY - pt.y) / 260); s.lastY = pt.y; }
-        else if (s.mode === 'volume') { this.volume((s.lastY - pt.y) / 260); s.lastY = pt.y; }
+
+        /* ② 水平：整批交还 B 站原生进度手势，脚本一点都不碰。
+           松手前 s.axis 恒为 'h'，中途上下抖动也绝不会切去调亮度/音量。 */
+        if (s.axis === 'h') {
+          if (C.seekPass) {
+            P.seekPass++;
+            return;                                          // 不 blockNative / 不 preventDefault
+          }
+          /* 关掉「水平让行」时回到旧行为：独占但脚本不做事（回退口） */
+          this.blockNative(e, true, P);
+          return;
+        }
+
+        /* ③ 垂直：独占 move，掐掉 B 站原生音量 HUD。
+           定轴后不再重新分左右半屏 —— 「要调啥就定啥」。 */
+        s.moved = true;
+        this.blockNative(e, true, P);
+        if (!s.mode) {
+          if (!C.bright) return;                             // 用户关了亮度/音量手势
+          s.mode = s.x < window.innerWidth / 2 ? 'bright' : 'volume';
+          /* v2.3.8 · 旧版基线取 touchstart 的 y，定轴那一次 move 会把
+             前面 28px 死区的位移一次性补算进去 → 第一下突然跳一大截，
+             之后才跟手，读起来就是「慢半拍」。现在从定轴点开始增量，
+             死区就当死区（也符合「别太灵敏」），每一帧都即时响应。 */
+          s.lastY = pt.y;
+        }
+        /* v2.3.7 · 「别太灵敏」：分母从 260 → 420（默认，可配 160–900），
+           同样 100px 滑动亮度变化从 0.38 降到 0.24。 */
+        const delta = (s.lastY - pt.y) / C.slideScale;
+        if (s.mode === 'bright') { this.bright(delta); s.lastY = pt.y; }
+        else if (s.mode === 'volume') { this.volume(delta); s.lastY = pt.y; }
         return;
       }
       if (isEnd) { this.finish(t, e, 'root'); return; }
+    },
+    /* ============================================================
+       v2.3.8 · 「上下划调完音量，松手之后又弹原生 🔊 100%」
+       ------------------------------------------------------------
+       证据链：截图那个白底「🔊 100%」不是我们的竖条（我们显示 80%，
+       且是透明细轨），是 B 站播放器自己的音量 HUD；只在【松手】那一刻弹，
+       move 期间不弹 → 说明 B 站识别器是 down 记起点、up 按
+       「起点→终点总位移」补算一次。v2.3.4 为防状态机卡死放行 end，
+       补算就漏出来；v2.3.7 水平让行后识别器又活跃，于是复现。
+       直接掐 end 会卡死状态机（v2.3.4 已证实），所以这里：
+         ① stopImmediatePropagation 掐掉真实 end（B 站收不到终点坐标）
+         ② 同步派一个「坐标 = 手势起点」的净化 end，bubbles 走完整链路
+            → B 站状态机照常清零，但算出位移 ≈ 0 → 不弹 HUD
+         ③ 净化副本打 __bpeCleanEnd，window guard / on() 都跳过，不重复结算
+       只对【垂直手势】做；短按 / 水平 seek 完全不动（保住 v2.3.4 / v2.3.7）。
+       ============================================================ */
+    makeCleanEnd(type, x, y, target, real) {
+      let ev = null;
+      try {
+        if (type === 'pointerup' && typeof PointerEvent === 'function') {
+          ev = new PointerEvent('pointerup', { bubbles: true, cancelable: true,
+            clientX: x, clientY: y, pointerType: 'touch',
+            pointerId: (real && real.pointerId) || 1, isPrimary: true, button: 0, buttons: 0 });
+        } else if (type === 'mouseup' && typeof MouseEvent === 'function') {
+          ev = new MouseEvent('mouseup', { bubbles: true, cancelable: true,
+            clientX: x, clientY: y, button: 0, buttons: 0 });
+        } else {
+          ev = document.createEvent('Event'); ev.initEvent('touchend', true, true);
+          const pt = { clientX: x, clientY: y, pageX: x, pageY: y,
+            screenX: x, screenY: y, identifier: 0, target: target, force: 0 };
+          const def = (k, v) => { try { Object.defineProperty(ev, k, { value: v, configurable: true }); } catch (_) {} };
+          def('changedTouches', [pt]); def('touches', []); def('targetTouches', []);
+          def('clientX', x); def('clientY', y);
+        }
+        Object.defineProperty(ev, '__bpeCleanEnd', { value: true, configurable: true });
+      } catch (_) { return null; }
+      return ev;
+    },
+    neutralizeNativeEnd(e, s, noDispatch) {
+      const C = this.cfg();
+      if (!C.neutralizeEnd || !e || e.__bpeCleanEnd) return false;
+      const x = s ? s.x : (Number(e.clientX) || 0);
+      const y = s ? s.y : (Number(e.clientY) || 0);
+      try {
+        if (e.stopImmediatePropagation) e.stopImmediatePropagation();
+        else if (e.stopPropagation) e.stopPropagation();
+      } catch (_) {}
+      /* 刻意不调 preventDefault：不抑制浏览器合成 click，
+         短按路径根本不会进这里，垂直手势也没有 click 语义。 */
+      this.probe.nativeEndNeutralized++;
+      /* 同一次抬起的第二个兼容 end：第一轮副本已把 B 站状态机清零，
+         这里只掐真实事件（防止它按终点补算），不再重复派副本。 */
+      if (noDispatch) return true;
+      const target = (e.target && e.target.isConnected) ? e.target : (this.root || document.body);
+      const t = e.type || 'touchend';
+      const types = [];
+      if (t.indexOf('touch') === 0) { types.push('touchend', 'pointerup'); }
+      else if (t.indexOf('pointer') === 0) { types.push('pointerup', 'touchend'); }
+      else if (t === 'mouseup') { types.push('mouseup'); }
+      /* iPad 一次物理抬起常同时派 touchend + pointerup；
+         两种都派，保证 B 站哪条通道监听都能收到「零位移结束」。 */
+      types.forEach(tp => {
+        const ev = this.makeCleanEnd(tp, x, y, target, e);
+        if (ev) { try { target.dispatchEvent(ev); this.probe.cleanEndDispatched++; } catch (_) {} }
+      });
+      return true;
     },
     /* v2.3.3 · 结算逻辑抽出来，root 捕获层和 window 兜底层共用。
        quiet=true 只用于「新按下时清理僵尸 session」：清定时器 + 清 session，
@@ -2557,6 +3848,24 @@ const DEFAULTS = {
       P.ends++; P.endVia = via || 'root';
       try { P.endsByType[t] = (P.endsByType[t] || 0) + 1; } catch (_) {}
       clearTimeout(s.holdTimer); clearTimeout(s.lockTimer);
+      P.lastAxis = s.axis;                   // v2.3.7：留作「上一次手势」诊断
+      /* v2.3.9 · 「一松手实际音量就弹回 50%」的主修点：
+         B 站在手势结算时把 state.volume 写回 element.volume。
+         这里不清守卫，反而从松手时刻重新钉 volHoldMs，并排幂等复查，
+         把用户「保持一会儿才有概率同步」的经验变成确定性行为。 */
+      if (s.mode === 'volume' && C.volHold && !quiet) {
+        const target = this.clamp(Number(CFG.touchVolume), 0, 1, 0.8);
+        this.startVolGuard(target, C.volHoldMs, C.volPin);
+        this.scheduleVolChecks(C.volHoldMs);
+        P.volAfterRelease = null;
+        /* v2.3.10：B 站白胶囊常在松手那一刻才插入，窗口内持续扫描 */
+        try { VolHud.startWatch(C.volHoldMs + 200); VolHud.sweep('release'); } catch (_) {}
+      }
+      /* v2.3.8：同一次物理抬起的两个兼容 end（touchend / pointerup）
+         都要净化，留一个短窗口；只给垂直手势开，水平 seek 与短按不碰。 */
+      const wasVertical = s.axis === 'v' || s.mode === 'rate' ||
+        s.mode === 'bright' || s.mode === 'volume';
+      this.cleanEndUntil = (wasVertical && !quiet) ? (Date.now() + 260) : 0;
       this.session = null;
       /* v2.3.5 · 松手 / 松鼠标立刻消失，不等 1.6s 淡出；
          同时撤掉 restoreRate 的让位标记，恢复正常倍速记忆校正。 */
@@ -2564,7 +3873,10 @@ const DEFAULTS = {
       try { CORE.touchRate = { active: false, session: 'idle', rate: this.rateNow() }; } catch (_) {}
       // 短按：不 preventDefault、不 stopPropagation、不合成 click
       // → B 站原生「单击显隐工具栏 / 双击播放暂停」照常。
-      const short = !s.moved && !s.mode && (Date.now() - s.t) < C.holdMs;
+      /* v2.3.7 · 水平 seek 手势有 s.mode='seek' 但 s.moved=false；
+         它和短按一样「不碰倍速、不弹 HUD」，但仍要让 end 完整放行
+         给 B 站状态机（v2.3.4 铁律），所以不能算 short 提前 return。 */
+      const short = !s.moved && !s.mode && !s.axis && (Date.now() - s.t) < C.holdMs;
       if (short || quiet) return;
       /* ============================================================
          v2.3.4 · 这行旧代码是「没堵上」的真正根因，必须删掉。
@@ -2593,14 +3905,14 @@ const DEFAULTS = {
       }
       if (s.mode === 'rate') {
         if (s.slideDown === 'lock') {
-          this.writeRate(s.rate);
+          this.writeRate(s.rate, true);
         } else if (s.slideDown === 'unlock') {
-          this.writeRate(1);
+          this.writeRate(1, true);
         } else if (s.locked || s.stepped !== 0) {
-          CFG.touchLockRate = s.rate; save(); this.writeRate(s.rate);
+          CFG.touchLockRate = s.rate; save(); this.writeRate(s.rate, true);
         } else {
           const back = s.wasLocked || s.baseRate;
-          this.writeRate(back);
+          this.writeRate(back, true);
         }
         // 结算后再隐藏一次（上面的 writeRate 不碰 HUD），保证松手即无 UI
         this.hideGesture();
@@ -2635,9 +3947,23 @@ const DEFAULTS = {
       ['pointerdown', 'pointermove', 'pointerup', 'pointercancel',
        'touchstart', 'touchmove', 'touchend', 'touchcancel', 'mouseup', 'blur'].forEach(t =>
         window.addEventListener(t, e => {
-          const s = self.session; if (!s) return;      // 没有 session = 完全放行
-          /* blur 只安静清 session，绝不拦事件（否则会掐掉页面的切页恢复逻辑） */
-          if (END[t]) { self.finish(t, e, 'guard-end', t === 'blur'); return; }
+          if (e && e.__bpeCleanEnd) return;        // v2.3.8：自己派的净化副本
+          const s = self.session;
+          if (END[t]) {
+            /* blur 只安静清 session，绝不拦事件（否则会掐掉切页恢复逻辑） */
+            if (t === 'blur') { if (s) self.finish(t, e, 'guard-end', true); return; }
+            if (s) {
+              const vert = s.axis === 'v' || s.mode === 'rate' ||
+                s.mode === 'bright' || s.mode === 'volume';
+              if (vert) self.neutralizeNativeEnd(e, s);  // 掐真实 end + 派零位移副本
+              self.finish(t, e, 'guard-end', false);
+            } else if (Date.now() < (self.cleanEndUntil || 0)) {
+              /* 同一次手势的第二个兼容 end；session 已清，只净化不重复结算 */
+              self.neutralizeNativeEnd(e, null, true);
+            }
+            return;                                  // 其余（短按 / 水平）完全放行
+          }
+          if (!s) return;                            // 没有 session = 完全放行
           if (MOVE[t]) {
             if (self.notPressed(e)) {
               self.probe.noButtonMoves++;
@@ -2646,16 +3972,12 @@ const DEFAULTS = {
               self.finish(t, e, 'guard-nobutton', true);
               return;
             }
-            const C = self.cfg();
-            /* v2.3.3 自查修：s.moved 是由 on() 内部设置的，第一个真正滑动的 move
-               到这里时还是 false；若只靠它判 active，window 层会放行第一个 move，
-               B 站 document 捕获层的手势识别器就先收到了 —— 这正是「松开后
-               又冒出原生音量条」的残留路径。这里自己按起点算位移。 */
-            const pt0 = self.point(e);
-            const movedNow = Math.abs(pt0.y - s.y) > 10 || Math.abs(pt0.x - s.x) > 10;
-            const active = !!(s.mode || s.moved || movedNow || Date.now() - s.t >= C.holdMs);
-            if (!active) return;                      // 短按微小抖动：连拦都不拦
-            self.on(t, e);                            // on() 内 blockNative 在 window 层就 stop
+            /* v2.3.7 · 每个「手指/鼠标仍按下」的 move 都交给 on() 统一判轴。
+               旧版这里用 10px + s.moved 预判 active，会漏掉定轴那第一个 move
+               （定轴阈值已提到 28px），B 站 document 层就先收到一次垂直 move，
+               原生音量条又冒出来。on() 自己会在未定轴 / 水平手势时完全放行，
+               所以多调几次没有副作用，反而保证「第一个该拦的 move」不漏。 */
+            self.on(t, e);
           }
         }, { capture: true, passive: false }));
       LOG('TouchV3', 'window 捕获兜底已装 · 拖出画面外松开 / 未按下 hover 都会收手');
@@ -2682,9 +4004,23 @@ const DEFAULTS = {
         const v = this.video();
         if (v && !v.__bpeV3Mode) {
           v.__bpeV3Mode = true;
+          /* v2.4.0 自查修复：这里旧代码用了块级作用域的 self，但 install()
+             内并没有定义它 —— 真机一旦进 WebKit 画中画就会抛
+             ReferenceError。改用词法 this，并顺带同步到 BgPlay 诊断。 */
+          const self2 = this;
           v.addEventListener('webkitpresentationmodechanged', () => {
-            self.probe.presentationMode = v.webkitPresentationMode || null;
-          });
+            self2.probe.presentationMode = v.webkitPresentationMode || null;
+            try { BgPlay.capability(v); } catch (_) {}
+          }, { passive: true });
+        }
+        /* v2.3.10：实例层接管 volume + 初始化扫描（不新增 Observer） */
+        try { VolHud.own(v); VolHud.startWatch(400); } catch (_) {}
+        /* v2.3.9：音量巩固守卫，只在元素层装一次；用 passive 监听，
+           volumechange 不可取消，不需要 passive:false。 */
+        if (v && !v.__bpeVolGuardBound) {
+          v.__bpeVolGuardBound = true;
+          v.addEventListener('volumechange', () => this.onVolumeChange(), { passive: true });
+          LOG('TouchV3', '音量巩固守卫已绑定 volumechange');
         }
       } catch (e) {}
       return true;
@@ -2692,6 +4028,11 @@ const DEFAULTS = {
     uninstall() {
       if (this.root) { try { this.root.classList.remove('bpe-tv3'); } catch (e) {} }
       this.root = null; this.session = null;
+      /* v2.3.9：关掉触控开关时守卫一并撤干净，不再写回 volume */
+      this.volGuard = null;
+      CORE.touchVolGuardActive = false;
+      clearTimeout(this._volGuardFlagT);
+      this._volCheckT.forEach(t => clearTimeout(t)); this._volCheckT = [];
     },
     diag() {
       const C = this.cfg();
@@ -2713,9 +4054,47 @@ const DEFAULTS = {
         releaseEnd: C.releaseEnd, endReleased: this.probe.endReleased,
         endBlocked: this.probe.endBlocked,
         hudKind: this.probe.hudKind, rateText: this.probe.rateText,
-        rateIdx0: this.probe.rateIdx0, lockDist: this.probe.lockDist,
+        rateIdx0: this.probe.rateIdx0, rateCap: this.probe.rateCap,
+        touchRates: (Array.isArray(CFG.rateList) ? CFG.rateList : []).filter(x => x >= 1 && x <= (Number(CFG.touchRateCap) || 6)),
+        keyboardRates: CFG.rateList.length,
+        lockDist: this.probe.lockDist,
         stepDist: this.probe.stepDist, levelVisible: this.probe.levelVisible,
         hudMode: 'v2.3.5 竖条 / 轻提示',
+        /* v2.3.7 自查：probe 上的缓存值只在发生过 move 后才有，
+           boot 后第一次打开诊断会全是 null；改用 cfg() 的实时常量。
+           axis 也改成「当前 session 的定轴 / 上一次手势的定轴」。 */
+        axis: this.session ? this.session.axis : (this.probe.lastAxis || null),
+        axisPx: C.axisPx, axisRatio: C.axisRatio,
+        slideScale: C.slideScale, hudSec: C.hudSec,
+        seekPass: this.probe.seekPass,
+        nativeEndNeutralized: this.probe.nativeEndNeutralized,
+        cleanEndDispatched: this.probe.cleanEndDispatched,
+        placeSkipped: this.probe.placeSkipped,
+        neutralizeEnd: C.neutralizeEnd,
+        volumeGuard: {
+          active: !!(this.volGuard && Date.now() < this.volGuard.until),
+          target: this.probe.volTarget,
+          untilLeft: this.volGuard && this.volGuard.until < Number.MAX_SAFE_INTEGER
+            ? Math.max(0, this.volGuard.until - Date.now()) : (this.volGuard ? 'pin' : 0),
+          writes: this.probe.volGuardWrites, checks: this.probe.volGuardChecks,
+          afterRelease: this.probe.volAfterRelease, prefSynced: this.probe.volPrefSynced,
+          hold: C.volHold, holdMs: C.volHoldMs, pin: C.volPin,
+          preferredVolume: Number(CFG.preferredVolume),
+          elementVolume: (() => { try { return Number(this.video().volume); } catch (_) { return null; } })(),
+          layerNote: 'v2.3.10：白胶囊按 B 站 DOM 屏蔽（见 volHud.killed）；本条 = element.volume，已在实例层接管'
+        },
+        volWritesBlocked: this.probe.volWritesBlocked,
+        volWriteAttempts: this.probe.volWriteAttempts.slice(),
+        volumeOwned: this.probe.volumeOwned, ownFail: this.probe.ownFail,
+        volHud: VolHud.diag(),
+        hudTransition: 'none (v2.3.8)', axisBaseline: '定轴点 y',
+        ambiguous: this.probe.ambiguous, rateHudAutoHide: this.probe.rateHudAutoHide,
+        seekPassEnabled: C.seekPass, lockSec: C.lockSec,
+        rateGate: { writes: Rate.writes, coalesced: Rate.coalesced,
+          suppressed: Rate.suppressed, verified: Rate.verified,
+          coalesceMs: Number(CFG.rateCoalesceMs) || 0,
+          silenceLeft: Math.max(0, Rate.silenceUntil - Date.now()) },
+        rateProbeMode: this.probe.rateProbeMode || null,
         hud: (() => {
           try {
             const h = sr ? sr.querySelector('.bpe-touch-hud') : null;
@@ -2746,6 +4125,29 @@ const DEFAULTS = {
     }
   };
   Bus.register('touchV3Diag', () => TouchV3.diag());
+  Bus.register('bgPip', () => {
+    try { BgPlay.probe.pipBtnClicks++; } catch (_) {}
+    const v = BgPlay.v || findVideo();
+    if (v && BgPlay.isPip(v)) { BgPlay.exit('⧉ 按钮（已在小窗）'); toast('↩ 已退出小窗'); return; }
+    /* 关键：enter() 的 WebKit 路径在第一个 await 之前同步执行，
+       所以这次调用仍处于按钮 click 的用户手势栈里 —— PiP 才会真渲染。 */
+    BgPlay.enter('⧉ 手势内建窗').then(ok => {
+      toast(ok ? '⧉ 小窗已建立 · 现在切网页 / 退出 Safari 都会继续' : '⚠ 未能建立小窗 · 已复制后台诊断看原因');
+      if (!ok) { try { copyText(JSON.stringify(BgPlay.diag(), null, 2)); } catch (_) {} }
+    });
+  });
+  Bus.register('bgPipExit', () => { const ok = BgPlay.exit('手动命令'); toast(ok ? '↩ 已退出小窗' : '⚠ 当前不在小窗'); });
+  Bus.register('bgDiag', () => {
+    try { copyText(JSON.stringify(BgPlay.diag(), null, 2)); toast('📋 已复制后台播放诊断 · 看 api.supportsMode / pip.lastError / session.handlers'); }
+    catch (e) { toast('⚠ 诊断失败：' + (e && e.message)); }
+  });
+  Bus.register('volHudKill', () => {
+    try {
+      const n = VolHud.sweep('manual');
+      VolHud.startWatch(800);
+      toast('🚫 已扫描并屏蔽 ' + n + ' 个音量胶囊 · 诊断看 volHud.killed');
+    } catch (e) { toast('⚠ 扫描失败：' + (e && e.message)); }
+  });
   Bus.register('touchHudTest', () => {
     TouchV3.hud('🔔 HUD 测试', '看到这行字 = 提示层正常 · 1.6 秒后消失', 0.5, 'center');
     toast('🔔 已弹出 HUD 测试');
@@ -2779,10 +4181,19 @@ const DEFAULTS = {
     const swallow = (name) => {
       const proto = (name === 'webkitEnterFullscreen') ? (window.HTMLVideoElement && HTMLVideoElement.prototype) : (window.Element && Element.prototype);
       if (!proto || !proto[name]) return;
+      const orig = proto[name];
       try {
         Object.defineProperty(proto, name, {
           configurable: true, writable: true,
           value: function () {
+            /* v2.4.1：用户开「临时恢复原生播放器」时把调用原样交回 WebKit，
+               让 B 站全屏按钮进 AVPlayerViewController，从而拿到系统
+               fullscreen→后台自动 PiP。默认关，保持 v2.1.3 的弃用行为。 */
+            if (CFG.bgNativePlayer === true) {
+              try { BgPlay.probe.nativePlayerAllowed++; } catch (_) {}
+              LOG('Full', '已放行 ' + name + '（临时恢复原生播放器 / 系统 PiP 模式）');
+              return orig.apply(this, arguments);
+            }
             CORE.sysFullBlocked++;
             LOG('Full', '已拦截 ' + name + '（系统全屏已弃用）');
             return typeof Promise !== 'undefined' ? Promise.resolve() : undefined;
@@ -2827,6 +4238,7 @@ const DEFAULTS = {
           'button[title*="全屏"],[aria-label*="全屏"]');
       } catch (_) {}
       if (webHit) { setTimeout(exitNativePlayer, 0); return; }   // B 站自切网页全屏，脚本不插手
+      if (sysHit && CFG.bgNativePlayer === true) return;   // v2.4.1：放行系统全屏按钮
       if (sysHit) {
         // 防递归：找不到网页全屏按钮时 fallback 可能也返回系统按钮，
         // 而 WebFull.toggle 里的 b.click() 会再派发一次 click 回到这里。
@@ -2993,14 +4405,18 @@ const DEFAULTS = {
     // v2.1.0：curVideo 已是 findVideo 的缓存，按键不再全量 deepFind 扫 DOM
     const v = curVideo || findVideo(); if (!v) return toast('未找到视频');
     const list = CFG.rateList.slice().sort((a, b) => a - b);
-    const cur = v.playbackRate;
+    /* v2.3.6：合并窗口内 v.playbackRate 还是旧值，若按它算下一档，
+       连按 ] ] ] 会三次都算出同一个 1.25×。改用已排队的意图档位。 */
+    const cur = (Rate.intent !== null && Rate.intent !== undefined)
+      ? Number(Rate.intent) : v.playbackRate;
     let next;
     if (dir > 0) {
       next = list.find(r => r > cur + 0.001);
-      if (next === undefined) next = Math.min(16, cur + 0.25);
+      /* v2.5.0：到 32× 顶档不再凭空造表外档位 */
+      if (next === undefined) next = list[list.length - 1];
     } else {
       const lower = list.filter(r => r < cur - 0.001);
-      next = lower.length ? lower[lower.length - 1] : Math.max(0.0625, cur - 0.25);
+      next = lower.length ? lower[lower.length - 1] : list[0];
     }
     Rate.apply(v, next, true);
   }
@@ -3016,6 +4432,12 @@ const DEFAULTS = {
       checkedAt: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
       currentRate: v ? v.playbackRate : null, rememberedRate: CFG.rate,
       longPressCancelRate: CFG.longPressCancelRate, officialHoldToNormal: CFG.officialHoldToNormal,
+      rateGate: { writes: Rate.writes, coalesced: Rate.coalesced,
+        suppressed: Rate.suppressed, verified: Rate.verified,
+        coalesce: CFG.rateCoalesce !== false, coalesceMs: Number(CFG.rateCoalesceMs) || 0,
+        silenceMs: Rate.silenceMs, silenceLeft: Math.max(0, Rate.silenceUntil - Date.now()),
+        noPitch: CFG.rateNoPitch === true, muteSwap: CFG.rateMuteSwap === true,
+        pitchSupported: Rate.pitch(false, findVideo()) },
       holdThresholdMs: CFG.holdThresholdMs,
       officialHoldActive: !!(CORE.officialHold && CORE.officialHold.active),
       official3xSeen: !!(CORE.officialHold && CORE.officialHold.official3xSeen) ||
@@ -3443,7 +4865,7 @@ const DEFAULTS = {
       CFG.rate = 1; CFG.touchLockRate = 0; save();
       CORE.touchLock = { rate: 0 };
       const v = curVideo || findVideo();
-      if (v) Rate.set(v, 1, { quiet: true, tag: '解除锁定' });
+      if (v) Rate.set(v, 1, { quiet: true, immediate: true, tag: '解除锁定' });
       this.hideLock(); this.hideHud();
       CORE.touchRate = { active: false, session: 'idle', rate: 1 };
       CORE.touchDiag = Object.assign({}, CORE.touchDiag || {}, {
@@ -3960,7 +5382,7 @@ const DEFAULTS = {
       video: v ? { muted: v.muted, volume: v.volume, paused: v.paused } : null,
       systemVolume: 'iPad 上由侧键 / 控制中心控制；网页 JS 无 API 读取或设置',
       whyOnIPad: volumeIsSettable() ? '当前浏览器 volume 可写，记忆值会写回 <video>'
-        : 'iOS/iPadOS Safari 的 volume 只读且恒为 1（Apple 官方），硬件音量键不触发 volumechange；脚本只控制 muted，不碰系统音量'
+        : 'v2.3.10 实测更正：本机 video.volume 可写且生效，已在实例层接管；白胶囊按 B 站 DOM 屏蔽（见 volHud.killed）。脚本只管 element 层，不碰系统音量'
     });
     copyText(JSON.stringify(d, null, 2));
     toast('已复制音量诊断 · 看 volumeSettable / preferredVolume / systemVolume');
@@ -4076,6 +5498,148 @@ const DEFAULTS = {
      ① iPad Safari 的触摸可能伴随重复 click（ghost click），隐式取反会让刚展开的
         二级菜单立刻被同一次手势关掉 —— 这正是「二级闪一下就消失」的另一半原因；
      ② 打开时同时确认 host 处于最高层（v1.8 的 closeSearch 曾把它清掉）。 */
+  /* ============================================================
+     v2.5.0 · 可拖动控制台
+     - FAB 收起 / 展开都能拖；dock 实时跟随
+     - 松手吸附到就近的左 / 右边缘，位置记入 Store
+     - 一级菜单方向：上方空间不足 → 向下；下方空间不足 → 向上
+     - 不合成 click、不拦短按；拖拽结束复用 v1.8.1 的 dockToggledAt
+       320ms 去重吃掉 iPad 的 ghost click，避免刚拖完菜单被误关
+     ============================================================ */
+  /* v2.5.1 · 一级菜单操作键右侧显示当前热键。
+     只认 data-act="cmd:xxx" → CFG.shortcuts[xxx]；没绑 / 非命令按钮留空。
+     录完键会走 render()，展开 dock 会走 setDock(true)，两处都刷新。 */
+  function dockKeyOf(act) {
+    const m = String(act || '').match(/^cmd:([A-Za-z0-9_]+)$/);
+    if (!m) return '';
+    return (CFG.shortcuts && CFG.shortcuts[m[1]]) || '';
+  }
+  function syncDockKeys() {
+    if (!sr) return;
+    try {
+      $$('.bpe-dock .bpe-mini', sr).forEach(b => {
+        const k = dockKeyOf(b.dataset.act);
+        const badge = b.querySelector('.bpe-mini-key');
+        if (badge) badge.textContent = k;
+        b.dataset.keyLabel = k;      // 诊断 / 冒烟可读，不影响界面
+      });
+    } catch (_) {}
+  }
+  const CONSOLE_GAP = 14;
+  /* v2.5.1 · 右下角禁区：side=right 且 y 超过这条线时统一抬到线上，
+     拖动过程中也 clamp（避免松手瞬间大跳）。左侧不限制，用户只反馈右下。 */
+  function clampCornerY(py, G, nearRight) {
+    if (!nearRight) return py;
+    const maxY = G.vh - G.H - CORNER_SAFE;
+    return maxY > CONSOLE_GAP ? Math.min(py, maxY) : py;
+  }
+  function consoleGeom() {
+    const fab = $('.bpe-fab', sr);
+    return {
+      W: (fab && fab.offsetWidth) || 56,
+      H: (fab && fab.offsetHeight) || 56,
+      vw: window.innerWidth || 1366,
+      vh: window.innerHeight || 1024
+    };
+  }
+  function applyConsolePos(free, dragX, dragY) {
+    const fab = $('.bpe-fab', sr); if (!fab) return { px: 0, py: 0, up: true };
+    const G = consoleGeom();
+    const pos = CORE.consolePos;
+    const side = (pos && pos.side === 'left') ? 'left' : 'right';
+    const rawX = free ? dragX : (side === 'left' ? CONSOLE_GAP : G.vw - G.W - CONSOLE_GAP);
+    /* isFinite(null) === true（Number(null)=0），必须显式判对象，否则 boot 即崩 */
+    const hasPos = !!(pos && isFinite(pos.y));
+    /* v2.5.1 · 默认改为「右侧垂直居中」，不再是右下角 */
+    const rawY = free ? dragY : (hasPos ? pos.y : Math.round((G.vh - G.H) / 2));
+    const px = Math.max(6, Math.min(G.vw - G.W - 6, rawX));
+    const nearRight = free ? (dragX + G.W / 2 > G.vw / 2) : (side === 'right');
+    const py = clampCornerY(Math.max(CONSOLE_GAP, Math.min(G.vh - G.H - CONSOLE_GAP, rawY)), G, nearRight);
+    fab.style.left = px + 'px'; fab.style.top = py + 'px';
+    fab.style.right = 'auto'; fab.style.bottom = 'auto';
+
+    /* ⧉ 小窗按钮跟着 FAB，避免拖走控制台后按钮孤零零留在原处 */
+    try {
+      const pb = $('.bpe-pip-btn', sr);
+      if (pb) {
+        pb.style.left = (px + (G.W - 38) / 2) + 'px';
+        pb.style.top = (py - 48) + 'px';
+        pb.style.right = 'auto'; pb.style.bottom = 'auto';
+      }
+    } catch (_) {}
+
+    const dock = $('.bpe-dock', sr);
+    if (!dock) return { px: px, py: py, up: true };
+    const n = $$('.bpe-dock .bpe-mini', sr).length || 8;
+    const dockH = Math.max(dock.offsetHeight || 0, n * 54);
+    const above = py;                  // FAB 上方空间
+    const below = G.vh - (py + G.H);   // FAB 下方空间
+    /* 优先向上（常规手感）；上方不够才向下；两边都不够选较大的一侧 */
+    const up = (above >= dockH + 12) || (above >= below);
+    dock.style.left = side === 'left' ? CONSOLE_GAP + 'px' : 'auto';
+    dock.style.right = side === 'right' ? CONSOLE_GAP + 'px' : 'auto';
+    dock.style.top = 'auto'; dock.style.bottom = 'auto';
+    if (up) dock.style.bottom = (G.vh - py + 10) + 'px';
+    else dock.style.top = (py + G.H + 10) + 'px';
+    dock.classList.toggle('at-left', side === 'left');
+    dock.classList.toggle('expand-down', !up);
+    CORE.consoleDir = up ? 'up' : 'down';
+    return { px: px, py: py, up: up };
+  }
+  function setupConsoleDrag() {
+    const fab = $('.bpe-fab', sr); if (!fab) return;
+    try {
+      const saved = Store.get('consolePos', null);
+      if (saved && (saved.side === 'left' || saved.side === 'right') && isFinite(saved.y))
+        CORE.consolePos = { side: saved.side, y: Number(saved.y) };
+    } catch (_) {}
+    applyConsolePos(false);
+    let drag = null;
+    const down = e => {
+      if (e.button != null && e.button !== 0 && e.pointerType === 'mouse') return;
+      try { e.preventDefault(); e.stopPropagation(); } catch (_) {}
+      const r = fab.getBoundingClientRect ? fab.getBoundingClientRect() : { left: 0, top: 0 };
+      drag = { sx: e.clientX, sy: e.clientY, ox: r.left, oy: r.top, moved: false, x: r.left, y: r.top };
+      fab.classList.add('dragging');
+      try { if (fab.setPointerCapture && e.pointerId != null) fab.setPointerCapture(e.pointerId); } catch (_) {}
+    };
+    const move = e => {
+      if (!drag) return;
+      /* CSS 已全局禁止选中；这里再拦一次默认行为，覆盖鼠标拖过文本的场景 */
+      try { if (e.cancelable && e.preventDefault) e.preventDefault(); } catch (_) {}
+      const dx = e.clientX - drag.sx, dy = e.clientY - drag.sy;
+      if (!drag.moved && Math.abs(dx) + Math.abs(dy) < 5) return;
+      drag.moved = true;
+      const G = consoleGeom();
+      const x = Math.max(6, Math.min(G.vw - G.W - 6, drag.ox + dx));
+      const y = Math.max(6, Math.min(G.vh - G.H - 6, drag.oy + dy));
+      drag.x = x; drag.y = y;
+      /* 拖动中不吸附，dock 也实时跟随，视觉上是一个整体 */
+      applyConsolePos(true, x, y);
+    };
+    const up = () => {
+      if (!drag) return;
+      const d = drag; drag = null;
+      fab.classList.remove('dragging');
+      if (!d.moved) return;               // 没拖动 → 不拦 click，正常展开菜单
+      const G = consoleGeom();
+      const side = (d.x + G.W / 2 < G.vw / 2) ? 'left' : 'right';
+      CORE.consolePos = { side: side, y: d.y };
+      const r = applyConsolePos(false);
+      CORE.consolePos.y = r.py;
+      CORE.consoleDragAt = Date.now();
+      /* 复用 v1.8.1 的 320ms ghost-click 去重：拖完那一下 click 不会误关菜单 */
+      CORE.dockToggledAt = Date.now();
+      try { Store.set('consolePos', CORE.consolePos); } catch (_) {}
+      LOG('Console', '已拖动并吸附到' + (side === 'left' ? '左' : '右') + '边缘 · 菜单' + (r.up ? '向上' : '向下') + '展开');
+    };
+    fab.addEventListener('pointerdown', down, { passive: false });
+    window.addEventListener('pointermove', move, { passive: false });
+    window.addEventListener('pointerup', up, { passive: true });
+    window.addEventListener('pointercancel', up, { passive: true });
+    window.addEventListener('resize', () => { try { applyConsolePos(false); } catch (_) {} }, { passive: true });
+    LOG('Console', '可拖动控制台已就绪 · 吸附边缘 / 菜单方向自适应');
+  }
   function setDock(on) {
     const d = $('.bpe-dock', sr);
     CORE.dockOpen = !!on;
@@ -4084,6 +5648,8 @@ const DEFAULTS = {
       d.hidden = !on;
       if (on) d.style.zIndex = '2147483600';
     }
+    /* v2.5.0：展开后 dock 才有高度，重算一次上/下方向 */
+    if (on) { syncDockKeys(); try { applyConsolePos(false); } catch (_) {} }
   }
   Bus.register('dock', () => {
     const now = Date.now();
@@ -4614,6 +6180,30 @@ const DEFAULTS = {
         esc(t.label) + (c ? '<i>' + esc(c) + '</i>' : '') + '</button>';
     }).join('');
   }
+  /* v2.5.0 · 综合「没内容」的真因：
+     /wbi/search/all/v2 的 data.result 是【按类型分组】的数组：
+       [{ result_type:'media_bangumi', data:[{…},{…}] },
+        { result_type:'video',         data:[{…},…] }, …]
+     而 /search/type 的 data.result 才是扁平单条数组。旧版把整组对象
+     直接丢给 fsNormalize() → r.title 为 undefined → 返回 null → 综合 0 条，
+     但切到「视频 / 番剧」分类走扁平接口就正常，正是你截图里的现象。
+     现在按组展开，并给每条打上 group 供仿官方分区渲染。 */
+  function fsFlatten(list, forceType) {
+    const out = [];
+    (Array.isArray(list) ? list : []).forEach(g => {
+      if (!g) return;
+      if (g.result_type && Array.isArray(g.data)) {
+        g.data.forEach(x => {
+          const n = fsNormalize(x, forceType || g.result_type);
+          if (n) { n.group = forceType || g.result_type; out.push(n); }
+        });
+      } else {
+        const n = fsNormalize(g, forceType || g.result_type || '');
+        if (n) { n.group = forceType || g.result_type || 'video'; out.push(n); }
+      }
+    });
+    return out;
+  }
   /* ---- 把各类型结果归一成同一张卡片 ---- */
   function fsNormalize(raw, forceType) {
     const r = (raw && raw.result_type && raw.data) ? raw.data : (raw || {});
@@ -4621,7 +6211,13 @@ const DEFAULTS = {
     const urlOf = v => { let u = String(v || ''); if (u.indexOf('//') === 0) u = 'https:' + u; return u; };
     const title = stripTags(r.title || r.name || r.uname || r.show_name || r.keyword || '');
     if (!title) return null;
-    let out = { title: title, pic: '', sub: '', kind: '', id: '', badge: '' };
+    let out = { title: title, pic: '', sub: '', kind: '', id: '', badge: '',
+      play: Number(r.play || r.view || 0) || 0,
+      pubdate: Number(r.pubdate || r.senddate || r.ctime || 0) || 0,
+      danmaku: Number(r.danmaku || r.video_review || r.review || 0) || 0,
+      favorites: Number(r.favorites || r.fav || 0) || 0,
+      score: stripTags(String(r.score || r.rating || '')),
+      epCount: Number(r.ep_size || (Array.isArray(r.eps) ? r.eps.length : 0)) || 0 };
     if (kind === 'bili_user' || kind === 'live_user' || kind === 'upuser') {
       out.kind = 'user'; out.id = String(r.mid || r.uid || ''); out.pic = urlOf(r.upic);
       out.sub = (r.usign ? stripTags(r.usign) + ' · ' : '') + (r.fans ? fsHuman(r.fans) + '粉丝' : '') +
@@ -4674,6 +6270,65 @@ const DEFAULTS = {
     LOG('Search', '打开结果 ' + u);
   }
   /* ---- 主体渲染 ---- */
+  /* v2.5.0 · 仿官方 search.bilibili.com 综合结果页布局：
+     排序 chips（综合排序 / 最多播放 / 最新发布 / 最多弹幕 / 最多收藏）
+       → 番剧·影视大卡 2 列（封面 + 简介 + 评分 + 立即观看）
+       → 「查看全部 N 部相关作品」切换番剧分类
+       → 视频小卡网格（缩略图 + 时长 + 标题 + UP）
+       → 其它类型列表
+     分类 tab 仍用原来的紧凑列表。所有链接仍走 fsUrl 白名单。 */
+  const FS_SORTS = [
+    { id: 'default', label: '综合排序' }, { id: 'play', label: '最多播放' },
+    { id: 'pubdate', label: '最新发布' }, { id: 'danmaku', label: '最多弹幕' },
+    { id: 'favorites', label: '最多收藏' }
+  ];
+  function fsSort(list, mode) {
+    if (!mode || mode === 'default') return list;
+    return list.slice().sort((a, b) => (Number(b[mode]) || 0) - (Number(a[mode]) || 0));
+  }
+  function fsCardVideo(r) {
+    return '<div class="bpe-fs-vcard" data-act="fsopen:' + r.kind + ':' + esc(r.id) + '">' +
+      '<div class="bpe-fs-vthumb">' +
+        (r.pic ? '<img src="' + esc(r.pic) + '" referrerpolicy="no-referrer" alt="">' : '<div class="ph"></div>') +
+        (r.sub ? '<span class="bpe-fs-dur">' + esc(String(r.sub).split(' · ')[0]) + '</span>' : '') +
+      '</div><b>' + esc(r.title) + '</b><small>' + esc(r.sub || '—') + '</small></div>';
+  }
+  function fsCardPgc(r) {
+    return '<div class="bpe-fs-pcard" data-act="fsopen:' + r.kind + ':' + esc(r.id) + '">' +
+      (r.pic ? '<img src="' + esc(r.pic) + '" referrerpolicy="no-referrer" alt="">' : '<div class="ph"></div>') +
+      '<div class="tx"><span class="tag">' + esc(r.badge) + '</span><b>' + esc(r.title) + '</b>' +
+      '<small>' + esc(r.sub || '') + '</small>' +
+      (r.score ? '<div class="bpe-fs-score">' + esc(r.score) + '分</div>' : '') +
+      '<span class="bpe-fs-watch">立即观看' + (r.epCount ? ' · 全' + r.epCount + '话' : '') + '</span></div></div>';
+  }
+  function fsRenderAll(f) {
+    const mode = f.sort || 'default';
+    const pgc = f.results.filter(r => r.group === 'media_bangumi' || r.group === 'media_ft' || r.kind === 'pgc');
+    const video = fsSort(f.results.filter(r => r.kind === 'video'), mode);
+    const other = f.results.filter(r => r.kind !== 'video' && r.kind !== 'pgc');
+    let h = '<div class="bpe-fs-sort">' + FS_SORTS.map(o =>
+      '<button data-act="fssort:' + o.id + '" class="' + (mode === o.id ? 'on' : '') + '">' + o.label + '</button>').join('') +
+      '<span class="bpe-fs-more">更多筛选 ⌄</span></div>';
+    if (pgc.length) {
+      h += '<div class="bpe-fs-head"><b>' + (pgc[0].group === 'media_ft' ? '影视' : '番剧') + '</b>' +
+        '<span>' + pgc.length + ' 部相关作品</span></div>' +
+        '<div class="bpe-fs-pgrid">' + pgc.slice(0, 4).map(fsCardPgc).join('') + '</div>' +
+        '<div class="bpe-fs-seeall" data-act="fstab:media_bangumi">查看全部 ' + pgc.length + ' 部相关番剧作品 ›</div>';
+    }
+    if (video.length) {
+      h += '<div class="bpe-fs-head"><b>视频</b><span>' + video.length + ' 条</span></div>' +
+        '<div class="bpe-fs-vgrid">' + video.slice(0, 12).map(fsCardVideo).join('') + '</div>';
+    }
+    if (other.length) {
+      h += '<div class="bpe-fs-head"><b>更多结果</b></div>' +
+        other.slice(0, 10).map(r => '<div class="bpe-fs-res" data-act="fsopen:' + r.kind + ':' + esc(r.id) + '">' +
+          (r.pic ? '<img src="' + esc(r.pic) + '" referrerpolicy="no-referrer" alt="">' : '<div class="ph"></div>') +
+          '<div class="tx"><b><span class="tag">' + esc(r.badge) + '</span>' + esc(r.title) + '</b>' +
+          '<small>' + esc(r.sub || '—') + '</small></div></div>').join('');
+    }
+    if (!pgc.length && !video.length && !other.length) h += '<div class="bpe-fs-empty">综合没有可展示的结果。</div>';
+    return h;
+  }
   function fsRenderBody() {
     const box = fsEl('.bpe-fs-body'); if (!box) return;
     const f = CORE.floatSearch;
@@ -4701,11 +6356,14 @@ const DEFAULTS = {
           esc((FS_TABS.find(t => t.id === f.tab) || {}).label || '综合') + '」下的结果。<br>换个分类或关键词试试。</div>';
         return;
       }
-      box.innerHTML = '<div class="bpe-fs-sec"><span>找到 ' + f.results.length + ' 条 · 点任意一条在新标签打开</span></div>' +
-        f.results.map(r => '<div class="bpe-fs-res" data-act="fsopen:' + r.kind + ':' + esc(r.id) + '">' +
-          (r.pic ? '<img src="' + esc(r.pic) + '" referrerpolicy="no-referrer" alt="">' : '<div class="ph"></div>') +
-          '<div class="tx"><b><span class="tag">' + esc(r.badge) + '</span>' + esc(r.title) + '</b>' +
-          '<small>' + esc(r.sub || '—') + '</small></div></div>').join('');
+      /* v2.5.0：综合按官方分区渲染；分类仍用紧凑列表 */
+      box.innerHTML = f.tab === 'all'
+        ? fsRenderAll(f)
+        : '<div class="bpe-fs-sec"><span>找到 ' + f.results.length + ' 条 · 点任意一条在新标签打开</span></div>' +
+          f.results.map(r => '<div class="bpe-fs-res" data-act="fsopen:' + r.kind + ':' + esc(r.id) + '">' +
+            (r.pic ? '<img src="' + esc(r.pic) + '" referrerpolicy="no-referrer" alt="">' : '<div class="ph"></div>') +
+            '<div class="tx"><b><span class="tag">' + esc(r.badge) + '</span>' + esc(r.title) + '</b>' +
+            '<small>' + esc(r.sub || '—') + '</small></div></div>').join('');
       return;
     }
     // ⑤ 空态：搜索历史 + bilibili 热搜（贴合原生下拉）
@@ -4768,7 +6426,9 @@ const DEFAULTS = {
         f.counts = c;
       }
       const list = Array.isArray(data.result) ? data.result : [];
-      f.results = list.map(x => fsNormalize(x, t.type || '')).filter(Boolean).slice(0, 30);
+      /* v2.5.0：综合按 result_type 分组展开，不再把整组对象当成一条 */
+      f.results = fsFlatten(list, t.type || '').slice(0, 40);
+      f.sort = 'default';
       LOG('Search', '结果 ' + f.results.length + ' 条 · 分类=' + f.tab + ' · 通道=' + channel);
       CORE.floatDiag = Object.assign({}, CORE.floatDiag || {}, {
         at: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
@@ -5100,6 +6760,17 @@ const DEFAULTS = {
     }
   }
   function updateBar() {
+    /* v2.4.1：⧉ 按钮只在「后台增强开 + 开关开 + 有视频在播」时出现 */
+    try {
+      const pb = $('.bpe-pip-btn', sr);
+      if (pb) {
+        const v = findVideo && findVideo();
+        const show = !!(CFG.enabled !== false && CFG.bgPlay !== false &&
+          CFG.bgPipButton !== false && v && v.readyState >= 2 && !v.ended);
+        pb.style.display = show ? 'block' : 'none';
+        if (show) pb.title = BgPlay.isPip(v) ? '已在画中画 · 点按退出' : '建立画中画小窗（切走后继续播放）';
+      }
+    } catch (_) {}
     const bar = $('.bpe-filterbar', sr); if (!bar) return;
     bar.hidden = !CFG.learnMode;
     if (!CFG.learnMode) return;
@@ -5323,16 +6994,23 @@ const DEFAULTS = {
         '<div class="bpe-mask" hidden></div>' +
         '<div class="bpe-filterbar" hidden></div>' +
         '<div class="bpe-dock" hidden>' +
-          '<button class="bpe-mini" data-act="ratepop">⚡ 倍速</button>' +
-          '<button class="bpe-mini" data-act="cmd:fullscreen">⛶ 全屏</button>' +
-          '<button class="bpe-mini" data-act="cmd:fillReset">🧹 复位</button>' +
-          '<button class="bpe-mini" data-act="cmd:capture">📷 截帧</button>' +
-          '<button class="bpe-mini" data-act="cmd:danmu">👁 弹幕显示</button>' +
-          '<button class="bpe-mini" data-act="cmd:triple">👍 三连</button>' +
-          '<button class="bpe-mini" data-act="cmd:learn">🎯 专注</button>' +
-          '<button class="bpe-mini" data-act="panel">🎛 设置</button>' +
+          /* v2.5.1：徽标是静态节点，syncDockKeys() 只写 textContent，不重建 DOM */
+          '<button class="bpe-mini" data-act="ratepop">⚡ 倍速<i class="bpe-mini-key"></i></button>' +
+          '<button class="bpe-mini" data-act="cmd:fullscreen">⛶ 全屏<i class="bpe-mini-key"></i></button>' +
+          '<button class="bpe-mini" data-act="cmd:fillReset">🧹 复位<i class="bpe-mini-key"></i></button>' +
+          '<button class="bpe-mini" data-act="cmd:capture">📷 截帧<i class="bpe-mini-key"></i></button>' +
+          '<button class="bpe-mini" data-act="cmd:danmu">👁 弹幕显示<i class="bpe-mini-key"></i></button>' +
+          '<button class="bpe-mini" data-act="cmd:triple">👍 三连<i class="bpe-mini-key"></i></button>' +
+          '<button class="bpe-mini" data-act="cmd:learn">🎯 专注<i class="bpe-mini-key"></i></button>' +
+          '<button class="bpe-mini" data-act="panel">🎛 设置<i class="bpe-mini-key"></i></button>' +
         '</div>' +
         '<button class="bpe-fab" data-act="cmd:dock" title="BilibiliPlus Xi/Elio">🎛</button>' +
+        /* v2.4.1：手势内建窗的唯一可靠入口，低可见度贴在画面右下 */
+        '<button class="bpe-pip-btn" data-act="cmd:bgPip" title="建立画中画小窗（切走后继续播放）" ' +
+          'style="position:fixed;right:18px;bottom:96px;z-index:2147483646;width:38px;height:38px;' +
+          'border-radius:19px;border:1px solid rgba(255,255,255,.28);background:rgba(18,18,22,.42);' +
+          'color:#fff;font-size:17px;line-height:36px;text-align:center;cursor:pointer;' +
+          'opacity:.42;display:none;pointer-events:auto;-webkit-tap-highlight-color:transparent">⧉</button>' +
         '<div class="bpe-ratepop" hidden></div>' +
         '<div class="bpe-panel" hidden>' +
           '<div class="bpe-head">' +
@@ -5341,7 +7019,7 @@ const DEFAULTS = {
             '<button class="bpe-x" data-act="close">✕</button>' +
           '</div>' +
           '<div class="bpe-body"><nav class="bpe-nav"></nav><main class="bpe-content"></main></div>' +
-          '<div class="bpe-foot">v2.3.5 · BilibiliPlus Xi/Elio · by Xi/Elio X. Blaze · 极简竖条 HUD</div>' +
+          '<div class="bpe-foot">v2.5.1 · BilibiliPlus Xi/Elio · by Xi/Elio X. Blaze · 选中限制 / 控制台避右下角</div>' +
         '</div>' +
         '<div class="bpe-toast" hidden></div>' +
         '<div class="bpe-touch-hud center" hidden><div class="bpe-th-main"></div><div class="bpe-th-sub"></div><div class="bpe-th-bar"><i></i></div></div>' +
@@ -5381,6 +7059,8 @@ const DEFAULTS = {
     CORE.confirmResolve = yes => { $('.bpe-confirm', sr).hidden = true; const cb = confirmCb; confirmCb = null; if (yes && cb) cb(); };
     bindUI();
     setupBarDrag();
+    setupConsoleDrag();   // v2.5.0：控制台可拖动 / 吸附 / 方向自适应
+    syncDockKeys();       // v2.5.1：初次渲染一级菜单热键
   }
   function toast(msg) {
     if (!sr) return;
@@ -5399,7 +7079,8 @@ const DEFAULTS = {
     fullscreen: '网页全屏 / 退出（转发 B 站按钮，不改 DOM）', fillToggle: '填充模式循环切换',
     fillReset: '复位全屏状态（黑屏自救）',
     mute: '静音切换', rateDown: '降一档倍速（长按相反档键回 1×）',
-    rateUp: '升一档倍速（长按相反档键回 1×）', learn: '一键开启 / 恢复学习模式'
+    rateUp: '升一档倍速（长按相反档键回 1×）', learn: '一键开启 / 恢复学习模式',
+    bgPip: '⧉ 建立画中画小窗（切走后继续播放）'
   };
   /* v2.0.0 信息架构：4 页 + 打赏页。
      ⌂ 概览＝状态总览 · ⚙ 功能开关＝所有设置 / 键位 / 档位 / 名单 / 直链
@@ -5424,7 +7105,7 @@ const DEFAULTS = {
   function tabHome() {
     const conflicts = detectConflicts();
     const tiles = [
-      ['扩展倍速', CFG.rateEnabled ? '0.5× ~ 5× 共 ' + CFG.rateList.length + ' 档 · 单帧合并写入' : '已关闭', CFG.rateEnabled],
+      ['扩展倍速', CFG.rateEnabled ? CFG.rateList[0] + '× ~ ' + CFG.rateList[CFG.rateList.length - 1] + '× 共 ' + CFG.rateList.length + ' 档 · 触控上限 ' + (Number(CFG.touchRateCap) || 6) + '×' : '已关闭', CFG.rateEnabled],
       ['触控倍速', CFG.touchRate ? '长按 2× · ' + (Number(CFG.touchLockSec) || 10) + 's 锁定 · 下滑解锁' : '已关闭', CFG.touchRate],
       ['移动端手势', CFG.touchBrightVolume ? '左半屏亮度 / 右半屏音量' : '已关闭', CFG.touchBrightVolume],
       ['网页全屏', '转发 B 站按钮 · 不改 DOM 布局', true],
@@ -5440,7 +7121,7 @@ const DEFAULTS = {
       '<div class="bpe-tags"><span>iPad Pro</span><span>iPadOS 26 / 27</span><span>Safari</span><span>Stay</span><span>单脚本</span></div></div>' +
       '<div class="bpe-grid">' + tiles + '</div>' +
       tabChips('home') +
-      '<div class="bpe-hint" style="margin:12px 2px">⌂ 概览＝状态总览 · ⚙ 功能开关＝所有设置与键位 · 🩺 自检＝诊断与登录检查 · 🕘 更新日志＝历史改动。所有开关即时生效、自动保存。</div>' +
+      '<div class="bpe-hint" style="margin:12px 2px">⌂ 概览＝状态总览 · ⚙ 功能开关＝所有设置与键位 · 🩺 自检＝诊断与登录检查 · 🕘 更新日志＝历史改动。控制台 🎛 可拖动、松手贴边；微调参数已固定，不用再一格格调。</div>' +
       '<div class="bpe-actions">' + btn('tab:switches', '⚙ 打开功能开关', 'primary') + btn('tab:selfcheck', '🩺 自检') + btn('tab:log', '🕘 更新日志') + '</div>' +
       (conflicts.length ? '<div class="bpe-hint">⚠️ 检测到同页存在 <b>' + conflicts.join('、') + '</b>，可能有快捷键 / 首页卡片冲突，去「🩺 自检」看排查。</div>' :
         '<div class="bpe-hint">✅ 未检测到主流 B 站改版脚本，当前为单脚本运行环境。</div>') +
@@ -5458,10 +7139,6 @@ const DEFAULTS = {
    * ============================================================ */
   function tabSwitches() {
     const hint = t => '<div class="bpe-hint">' + t + '</div>';
-    const num = (k, label, desc, min, max, step) =>
-      '<div class="bpe-row"><div class="bpe-row-t"><b>' + label + '</b><small>' + desc + '</small></div>' +
-      '<input class="bpe-input" style="width:110px" type="number" min="' + min + '" max="' + max +
-      '" step="' + step + '" data-cfg="' + k + '" value="' + CFG[k] + '"></div>';
     // 键位绑定表：原「快捷键」页整表搬来，data-key / data-act 原样
     const keyRows = Object.keys(SHORTCUT_LABELS).map(k =>
       '<tr><td>' + SHORTCUT_LABELS[k] + '</td><td><span class="bpe-kbd">' + esc(CFG.shortcuts[k] || '—') + '</span></td>' +
@@ -5479,7 +7156,7 @@ const DEFAULTS = {
       '<div class="bpe-hint">还没有直链。打开一个视频页，播放一下，再点「读取当前视频直链」。</div>';
 
     return '<h2 class="bpe-h1">功能开关</h2>' +
-      '<p class="bpe-lead">所有设置都在这里：开关、键位、档位、名单、直链。<b>即时生效、自动保存</b>。改完点 ×、点遮罩或按 Esc 关闭。</p>' +
+      '<p class="bpe-lead">开关、键位、名单、直链都在这里。<b>即时生效、自动保存</b>；毫秒 / 像素级微调已固定为实测最顺手的数值，不再逐格调。改完点 × 或按 Esc 关闭。</p>' +
       tabChips('switches') +
 
       '<div class="bpe-grouptitle">总开关</div>' +
@@ -5488,34 +7165,48 @@ const DEFAULTS = {
         '<div class="bpe-actions">' + btn('reset', '↺ 恢复默认设置') + btn('closestyle', '👓 临时移除注入样式') + '</div>' +
         hint('关掉总开关后所有快捷键与铺满增强停止工作，配置保留。') + '</div>' +
 
+      '<div class="bpe-grouptitle">📺 后台播放 / 画中画 / 控制中心</div>' +
+      '<div class="bpe-card">' +
+        sw('bgPlay', '启用后台播放增强', '切别的网页或 App 自动小窗、控制中心显示与控制；不调用系统全屏 API，与现有网页全屏 / 触控并行') +
+        sw('bgAutoPip', '实验：切后台仍尝试自动 PiP', '网页层做不到，默认关；开了也不计成功') +
+        sw('bgPipButton', '显示 ⧉ 小窗按钮（推荐）', '先点一下建窗，之后切网页 / 退出 Safari 都继续') +
+        sw('bgNativePlayer', '临时恢复原生播放器', '真·自动小窗，但触控手势会全失效；默认关') +
+        sw('bgExitOnReturn', '回到页面自动退出小窗', '默认关：保留系统小窗，点小窗可返回网页；开启则切回页面立刻内联') +
+        sw('bgMediaSession', '控制中心 / 锁屏接管继续与暂停', '注册 play / pause / seekbackward / seekforward / seekto，同步 playbackState；不注册切曲（iOS 锁屏 quirk，且会误切分 P）') +
+        sw('bgMetadata', '控制中心显示标题 / UP 主 / 封面', '只取页面已有数据（__INITIAL_STATE__ / og:image / 页面标题），不联网、不编造；静音媒体系统不显示控件') +
+        sw('bgPrewarm', '手势内预热画中画权限', '补齐属性、提前注册控制中心，不闪进 PiP') +
+        '<div class="bpe-actions">' + btn('cmd:bgPip', '⧉ 立即小窗') + btn('cmd:bgPipExit', '↩ 退出小窗') + btn('cmd:bgDiag', '📋 后台诊断') + '</div>' +
+        hint('⧉ 小窗也支持快捷键 <b>P</b>；切后台那一刻自动变小窗是 WebKit 限制，需先建窗。') + '</div>' +
+
       '<div class="bpe-grouptitle">⚡ 倍速</div>' +
       '<div class="bpe-card">' +
-        '<div class="bpe-chips">' + CFG.rateList.map(r => '<button class="bpe-chip ' + (Math.abs((CFG.rate || 1) - r) < 0.001 ? 'cur' : '') + '" data-act="rate:' + r + '">' + r + '×</button>').join('') + '</div>' +
+        hint('键盘 <b>［ / ］</b> 走完整 <b>' + CFG.rateList.length + ' 档</b>（' + CFG.rateList[0] + '× ~ ' + CFG.rateList[CFG.rateList.length - 1] + '×）；触控长按 / 上滑上限 <b>' + (Number(CFG.touchRateCap) || 6) + '×</b>。档位按「每 4 档换一次单位」递增，已固定。') +
+        '<details class="bpe-details"><summary>查看全部档位（点一下直接切换）</summary><div class="bpe-chips" style="margin-top:10px">' +
+        CFG.rateList.map(r => '<button class="bpe-chip ' + (Math.abs((CFG.rate || 1) - r) < 0.001 ? 'cur' : '') + '" data-act="rate:' + r + '">' + r + '×</button>').join('') + '</div></details>' +
         '<div class="bpe-actions">' + btn('cmd:rateDown', '［ 降一档') + btn('cmd:rateUp', '］ 升一档') + btn('cmd:rateNormal', '↩︎ 回 1×') + '</div>' +
         sw('rateEnabled', '启用倍速增强', '关闭后不再写入 playbackRate') +
         sw('rememberRate', '记住倍速', '新视频自动套用上次档位；长按归原速会把它清成 1×') +
         sw('longPressCancelRate', '长按相反档键取消倍速', '短按仍升/降一档；同向长按保留连续升降') +
         sw('officialHoldToNormal', '官方长按 3× 松开回 1×', '不拦右方向键；松开后不恢复之前档位') +
-        num('holdThresholdMs', '长按判定阈值 (ms)', '当前 ' + (Number(CFG.holdThresholdMs) || 340) + ' ms · Safari 不发 repeat 时按时间兜底', 120, 1200, 20) +
-        hint('短按 <code>[</code> / <code>]</code> 升降一档；长按相反档键回 1×；官方长按右方向键 3× 松开也回 1×，不恢复旧档位。所有写入同一帧合并，不再卡一下。') + '</div>' +
+        sw('rateCoalesce', '连续换档合并写入（减少卡顿）', 'WebKit 每次写 playbackRate 都会冻结画面约 300ms；短窗口内连按 / 上滑跨档只写最后一次') +
+        sw('rateNoPitch', '关闭音高保持（减少音频重采样）', '写入前设 preservesPitch / webkitPreservesPitch = false；声音会变尖，学习类视频建议保持关闭') +
+        sw('rateMuteSwap', '实验：换档瞬间临时静音', '不承诺有效，默认关') +
+        hint('单次换档约 300ms 停顿是 WebKit 平台 bug，脚本已把一次换档的多余写入压到 1 次。') + '</div>' +
 
-      '<div class="bpe-grouptitle">🖐 移动端同款触控（研究版）</div>' +
+      '<div class="bpe-grouptitle">🖐 移动端同款触控</div>' +
       '<div class="bpe-card">' +
       sw('touchV3', '启用移动端同款触控', '长按 2× / 上滑升档 / 按住锁定 / 下滑松手解锁') +
-      sw('touchBrightVolume', '左亮度 / 右音量手势', '未到长按时长就上下滑：左半屏调画面亮度，右半屏调新音量档位') +
-      sw('touchBlockNative', '屏蔽 B 站原生音量手势', '长按 / 滑动时独占 move，不再和网页原生音量 HUD 叠触发（短按仍完整放行）') +
-      sw('touchReleaseEnd', '松手事件放行给 B 站（防状态机卡死）', '关掉会掐断 pointerup/touchend，B 站会一直以为还在拖：松手后 hover 仍调音量、左右拖变 seek、单击改进度') +
-      num('touchV3HoldMs', '长按判定 (ms)', '当前 ' + (Number(CFG.touchV3HoldMs) || 280) + ' ms · 短按完全放行，B 站原生单击 / 双击照常', 120, 1200, 20) +
-      num('touchV3LockSec', '按住多少秒锁定', '当前 ' + (Number(CFG.touchV3LockSec) || 10) + ' s · 可 3–60 秒自定义', 3, 60, 1) +
-      num('touchV3SlidePx', '滑动多少像素变一档', '当前 ' + (Number(CFG.touchV3SlidePx) || 44) + ' px', 16, 160, 4) +
+      sw('touchBrightVolume', '左亮度 / 右音量手势', '左半屏调画面亮度，右半屏调网页音量') +
+      sw('touchBlockNative', '屏蔽 B 站原生音量手势', '短按仍完整放行，不抢单击 / 双击') +
+      sw('touchReleaseEnd', '松手事件放行给 B 站', '防止 B 站状态机卡死（别关）') +
+      sw('touchKillVolHud', '屏蔽 B 站白底音量胶囊', '命中即隐藏，不再弹出来挡画面') +
+      sw('touchOwnVolume', '直接接管网页音量', '实例层吞掉 B 站回写，从根上防回弹') +
+      sw('touchVolumeHold', '松手后巩固音量', '拖到 20% 松手不会被弹回 50%') +
+      sw('touchVolumePin', '持续钉住网页音量', '默认关，仅 B 站延迟特别久时才开') +
+      sw('touchNeutralizeNativeEnd', '实验：松手净化原生 end', '实机无效，默认关，仅作回退') +
+      sw('touchSeekPass', '左右滑交还 B 站原生进度手势', '水平手势脚本完全不插手') +
       '<div class="bpe-actions">' + btn('cmd:touchV3Diag', '📋 触控诊断') + btn('cmd:touchHudTest', '🔔 测试提示层') + btn('cmd:touchV3Unlock', '🔓 解除锁定') + btn('cmd:brightReset', '☀ 亮度复位') + '</div>' +
-      hint('<b>这版不是复活旧代码</b>，是按 WebKit 功能开关调研重写：监听只绑<b>播放器元素</b>（不绑 window/document 根 —— 根上 touch 监听默认 passive，<code>preventDefault()</code> 会被忽略，这正是前 9 版「上下滑都是音量、长按没反应」的真因）；显式 <code>{passive:false}</code>、第一个 move 就拦、<code>overscroll-behavior:contain</code> + <code>overflow-anchor:none</code> + <code>user-select:none</code> + <code>-webkit-touch-callout:none</code>（对应你截图里已开的三个 CSS 开关）；<b>放行 iPadOS 16.4+ 的 <code>Element.requestFullscreen()</code></b>，元素全屏时 DOM 仍在网页里、触摸可达，只吞把画面交给原生播放器的 <code>webkitEnterFullscreen</code>。倍速每次写入都<b>读回验证</b>、不生效就如实提示并尝试 B 站自己的倍速菜单，绝不假装成功。<b>不建顶层 tiles、不合成 click、短按不拦</b> → 单击显隐工具栏 / 双击暂停完整保留。') +
-      hint('<b>v2.3.5 极简 HUD + 倍速拖动修复</b>：① 亮度/音量改成<b>左右各一条竖细轨</b>（7px 宽、emoji + XX%、低可见度），<b>松手立刻消失</b>；非全屏放画面外，全屏放画面顶端 / 左右边缘。② 长按<b>不再显示</b>「几倍速 + 上下划」大段提示和进度条，只有上滑变档时闪一行「×多少」、下滑时提示「松开锁定倍速 / 松开还原倍速」。③ 修三个拖动 bug：<b>上滑升不了档</b>是旧版拿只到 2× 的 touchV3Rates 算档位而长按已是顶档，改用全局 0.5~5 档位表并按固定基准算（旧版还会连跳档）；<b>一直按着回原速</b>是 ratechange → Rate.correct() 拿键盘留下的旧 intent（常 1×）把触控写的 2× 改回去，现在写入前同步 intent + 让 restoreRate 让位；<b>锁定太灵敏</b>改成必须下滑超过 1/5 画面高度，上滑每档也改成 1/8 画面高度。诊断新增 <code>hudKind / rateText / rateIdx0 / lockDist / stepDist</code>。') +
-      hint('<b>v2.3.4 根因纠正</b>：上一版为了「防 B 站在松手时补算音量」，在 window 捕获层把 <code>pointerup / touchend</code> 也 <code>stopImmediatePropagation()</code> 掐了 —— 但 B 站手势识别器是「down 记起点 → move 累计 → <b>up 结算并清零状态机</b>」，掐掉 up 它就永远收不到「手势结束」，一直 armed。于是<b>松手后上下 hover 继续调音量、左右拖变成 seek、再点一下把积压状态结算成进度跳变 / 音量固定</b>，和你这轮反馈逐字对得上。「防补算」本就是我凭空推测、没有证据，代价却远大于收益。现在 <b>end 完整放行</b>（连 <code>preventDefault</code> 都不调），B 站正常收工；所有 <b>move 仍在 window 层独占掐掉</b>，它手里只有 down 起点 + up 终点，判定未达阈值正常结束。新增「松手事件放行给 B 站」开关（默认开，可回退）和诊断 <code>endReleased / endBlocked / releaseEnd</code>。') +
-      hint('<b>v2.3.3 修两处</b>：① <b>「还是没有任何 UI 提示」</b> 是真 bug —— 提示层 CSS 基础态是 <code>opacity:0</code>，必须加 <code>.on</code> 才可见，v2.3.x 重写 hud() 时漏了这一句，元素一直全透明（模拟验收只读 hidden 没读 CSS，又骗过去了）。现在补 <code>.on</code> + inline 强制可见，并加「🔔 测试提示层」按钮，点一下立刻能确认。② <b>拖出画面外松开后，没点按也能继续调亮度/音量</b>：旧版 end 只绑播放器 root，指针在画面外松开时事件链不经过 root → session 和定时器全没清，成僵尸态。现在加 <b>window 捕获兜底</b>（end / mouseup / blur 全局结算、未按下 hover 立刻收手、画面外 move 也在 window 层独占挡住 B 站），并让新按下先安静清掉旧 session。短按仍完全放行。诊断新增 <code>hud.found / hud.on / hud.opacity / sessionActive / endVia / noButtonMoves / globalGuard</code>。') +
-      hint('<b>v2.3.2 手势独占</b>：滑左侧调亮度时 B 站原生音量手势会叠着触发、长按下滑也被它抢成调音量 —— 因为 <code>preventDefault()</code> 只挡浏览器默认行为，挡不住 B 站自己注册的 touch 手势识别器。现在监听改到<b>捕获阶段</b>，手势激活后 <code>stopImmediatePropagation()</code> 让 B 站收不到这一批 move / end；短按仍完全放行，单击显隐工具栏 / 双击暂停不受影响。<b>提示词按你给的原话</b>：长按显示「上滑调高倍速档位 · 下滑锁定倍速」，锁定后长按显示「下滑解除倍速」；下滑锁定 / 上滑松手锁定 / 纯松手恢复各自独立。亮度与新音量都带 <b>XX% 百分比 + 进度条</b>，音量在 iPad 上若 <code>video.volume</code> 只读会如实标「网页音量档位（系统音量请用侧键）」，不冒充。') +
-      hint('<b>v2.3.1 真机诊断修复</b>：你回传的诊断里 <code>events:82</code> 但 <code>starts:0 / moves:0 / ends:0</code>、<code>lastReject:"控件让行"</code> —— 事件全到了脚本，倍速也确认可写（<code>rateWritable:true</code>、0.5/1/1.5/2 全档通过），CSS 四项全部生效，<b>WebKit 开关一个都不用动</b>。真因是旧 <code>inControl()</code> 用 <code>[class*="ctrl-bottom"]</code> 之类宽通配沿 B 站祖先链误命中，把按在画面正中央的每一次 <code>touchstart</code> 都判成控件直接丢弃。现在只认真正可交互元素本身 + video 矩形底部控制栏几何带，画面中央一律放行；诊断新增 <code>startsRejected / rejectTarget / endsByType</code>。') +
-      hint('<b>真机排查</b>：设置 → Safari → 高级 → WebKit 功能开关，用搜索框分别搜 <code>touch</code> / <code>fullscreen</code> / <code>audio</code> / <code>scroll</code> / <code>select</code> 并截图；改开关后要关标签页重开才生效。「📋 触控诊断」里的 <code>passiveWorks / rateWritable / presentationMode / acceptedRates</code> 是真机证据，复制发我即可精准定位。') + '</div>' +
+      hint('长按显示「2×倍速中」3 秒；按住 10 秒锁定；上滑升档（上限 6×）、下滑松手锁定 / 解除。所有毫秒与像素参数已固定。') + '</div>' +
 
       '<div class="bpe-grouptitle">⛶ 全屏</div>' +
       '<div class="bpe-card">' +
@@ -5527,16 +7218,15 @@ const DEFAULTS = {
         '</select></div>' +
         sw('fillEnabled', '启用铺满增强', '关掉后 F 仍然只是普通地切换 B 站全屏，不会黑屏') +
         '<div class="bpe-actions">' + btn('cmd:fullscreen', '⛶ F 网页全屏 / 退出', 'primary') + btn('cmd:fillToggle', '⇄ 换模式') + btn('cmd:fillReset', '🧹 复位') + '</div>' +
-        hint('<b>v2.1.4 修复「画面没了 / 超出屏幕」</b>：上一版给播放器容器强加 <code>position:fixed + 100vw/100vh + !important</code>，把 B 站内部 flex 与弹幕层定位撑坏了。这版<b>一个布局属性都不碰</b>：F 只点 B 站自己的「网页全屏」按钮，画面、弹幕、控制栏全由 B 站自己排；铺满只用 <code>&lt;video&gt;</code> 的 <code>object-fit</code> 轻微裁切。系统全屏 / 原生视频全屏仍全部禁用并精确改道，所以不会再出现「向下轻扫退出」。触控热区改为按 <code>&lt;video&gt;</code> 在屏幕上的几何位置判定，普通观看、宽屏、网页全屏都生效。') + '</div>' +
+        hint('F 只转发 B 站自己的网页全屏按钮，不改布局、不进系统全屏。') + '</div>' +
 
       '<div class="bpe-grouptitle">🎬 自动播放与音量</div>' +
       '<div class="bpe-card">' +
         sw('autoPlay', '打开视频后自动播放', '关掉则完全按 B 站原生行为') +
         sw('rememberVolume', '记住我调整过的音量', '关掉后仍会解除静音，但不再记忆 / 写回数值') +
         sw('autoUnmute', '自动解除静音', '只在真实手势回调里同步执行，不碰播放状态') +
-        num('preferredVolume', '记忆音量 (0–1)', '当前 ' + Math.round(CFG.preferredVolume * 100) + '% · volume 可写=' + (volumeIsSettable() ? '是' : '否（iPad）'), 0, 1, 0.05) +
         '<div class="bpe-actions">' + btn('cmd:autoPlayNow', '🎬 立即尝试起播') + btn('cmd:unmuteNow', '🔊 解除静音') + btn('cmd:mute', 'M 静音切换') + '</div>' +
-        hint('带声音优先起播、被拒回退静音；画面跑起来后立即收手，之后暂停一次就停住。<b>v2.1.6：不再预判手势</b>，直接试带声音起播；万一走静音回退，也会在 <code>play()</code> 成功后立刻再试一次零点击解除静音，被 Safari 回退就静音续播、画面不中断 —— 目标是一进播放页就有声音。<b>v2.1.5</b> 的手势监听（window 层 + touchstart / pointerdown）仍保留作兜底。若仍一直静音，先按「🔊 解除静音」，再复制「📋 触控诊断」看 <code>earlyUnmute</code> / <code>unmuteProbe</code>。iPad 系统音量网页无权读写，记忆的是你最后一次调整的意图值。') + '</div>' +
+        hint('一进播放页带声音起播、被拒才回退静音；画面跑起来立即收手，之后暂停一次就停住。当前记忆音量 <b>' + Math.round((Number(CFG.preferredVolume) || 0.8) * 100) + '%</b>（调整音量自动更新）。') + '</div>' +
 
       '<div class="bpe-grouptitle">🔍 搜索</div>' +
       '<div class="bpe-card">' +
@@ -5571,7 +7261,6 @@ const DEFAULTS = {
       '<div class="bpe-grouptitle">⬇ 下载与截帧</div>' +
       '<div class="bpe-card">' +
         sw('downloadEnabled', '读取当前视频直链', '关掉则不再自动抓取 playurl 流；不影响已列出的链接') +
-        num('captureMaxWidth', '截图最大宽度 (px)', '限制内存，长视频建议 1920 以内', 320, 3840, 160) +
         '<div class="bpe-actions">' + btn('mediarefresh', '🔄 读取当前视频直链', 'primary') + btn('cmd:capture', '📷 截取当前画面') + btn('savecap', '保存上一张截图') + btn('copycmd', '复制合并命令') + '</div>' +
         '<div style="margin-top:8px">' + mediaRows + '</div>' +
         hint('当前视频 ' + esc(currentBvid() || '未进入视频页') + ' · 只列你当前有权播放的流；DASH 高清档音视频分离，需 <code>ffmpeg -c copy</code> 合并。直链需要 Referer，请用 Stay 下载管理器。') + '</div>' +
@@ -5663,7 +7352,36 @@ const DEFAULTS = {
    * ============================================================ */
   function logSections() {
     return [
-      { t: 'v2.3.5 · 极简竖条 HUD / 修倍速拖动三处（当前）', open: true, h:
+      { t: 'v2.5.1 · 选中限制 / 控制台避右下角 / 设置居中 / 一级菜单热键（当前）', open: true, h:
+  '<div class="bpe-card"><h3>四件微修，都是实机反馈</h3><p>① <b>全局限制选中</b>：整页默认 <code>user-select:none</code>，只给「纯文本叶子元素」（<code>:not(:has(*)):not(:empty)</code>，排除按钮 / 图标 / 媒体 / 类名带 icon|btn|ctrl）和输入框显式开 <code>text</code>；<code>img/svg/a</code> 加 <code>-webkit-user-drag:none</code> 与 <code>-webkit-touch-callout:none</code>，拖控制台图标、做触控手势不会再拉出蓝色选区，也不会长按弹出「存储图像」。<br>② <b>控制台默认右侧中部</b>，右下角 <b>140px 见方</b>设为禁区（那里是 iPadOS 窗口化拖角调整大小的位置），吸附松手与拖动过程都 clamp，旧配置里落在禁区的位置在 schema 39 迁移时抬走。<br>③ <b>设置窗口居中</b>：<code>left/top:50% + translate(-50%,-50%)</code>，不再贴右下。<br>④ <b>一级菜单显示当前热键</b>：每个 <code>.bpe-mini</code> 右侧一枚小徽标，动态读 <code>CFG.shortcuts</code>，录完键即时刷新 —— 例如把三连改成 <b>d</b>，按钮就显示 <b>d</b>。</p></div>' +
+  '<div class="bpe-card"><h3>一行没动</h3><p>41 档倍速与触控上限 6×、综合搜索仿官方布局、吸附就近边缘、菜单上/下方向自适应、短按完全放行、ghost click 去重、10 项微调固定、⧉ 小窗 P 键、白胶囊屏蔽与音量接管、轴向锁定、S 原生 / Shift+S 浮层、三连、D 开关、R 刷新核对、起播出声、5 页签含打赏。仍是单 keydown / 单 keyup / 单 Observer。</p></div>' +
+  '' },
+{ t: 'v2.5.0 · 可拖动控制台 / 41 档倍速 / 综合搜索仿官方 / 设置瘦身（上一版）', open: false, h:
+  '<div class="bpe-card"><h3>五件事一起落地</h3><p>① <b>🎛 控制台可拖动</b>：FAB 收起 / 展开都能拖，<code>pointerdown/move/up</code> + <code>touch-action:none</code>，dock 实时跟随；松手按 FAB 中心吸附就近左 / 右边缘，位置写进 Store；菜单方向用「FAB 上方高度 / 下方高度 / dock 按钮数×54」算 —— 上方不足向下、下方不足向上。短按完全不拦，拖拽结束复用 v1.8.1 的 320ms 去重吃掉 ghost click。<br>② <b>⧉ 小窗快捷键 P</b>：新增 <code>bgPip</code> 命令，键位表可录键改。<br>③ <b>倍速 41 档</b>：按你给的「每 4 档换一次单位 0.25→0.5→1→2→4」排出 <code>1…32×</code>，小于 1 同样 20 档按倒数镜像；<code>Rate.apply</code> 旧的 <code>clamp(0.0625,16)</code> 会把 32× 砍成 16×，已改为以档位表为界。键盘走完整 41 档、<b>触控长按 / 上滑上限 6×</b>。<br>④ <b>综合搜索修好并仿官方</b>：真因是 <code>all/v2</code> 返回按 <code>result_type</code> 分组的 <code>data[]</code>，旧版把整组对象当一条 → 0 条。现在按组展开，按官方结果页分区渲染：排序 chips → 番剧大卡 2 列 → 查看全部 → 视频小卡 3 列网格。<br>⑤ <b>设置瘦身</b>：11 项「1ms / 1px 手调」滑块固定为人体工学值并移出界面（schema 38 迁移把被调乱的旧值写回），16 段历史说明从功能开关页清走，41 个档位 chip 折进 <code>&lt;details&gt;</code>。<b>只动界面，没动任何逻辑</b>。</p></div>' +
+  '<div class="bpe-card"><h3>验证阶段自查修掉 3 个真 bug</h3><p>① <code>applyConsolePos()</code> 里 <code>isFinite(pos &amp;&amp; pos.y)</code> 在 <code>pos=null</code> 时返回 <b>true</b>（<code>Number(null)=0</code>），接着读 <code>pos.y</code> 会让 boot 直接崩 —— 改成显式判对象；② 删历史说明时把「⚡ 倍速」「🖐 触控」两组的 <code>&lt;/div&gt;</code> 闭合一起删了，会让设置页错位，已补回并逐组核闭合；③ <code>Rate.apply</code> 的旧 clamp 让键盘升不到 32×。仍是模拟环境验证，不是真机。</p></div>' +
+  '' },
+{ t: 'v2.4.1 · 停用假自动 PiP / 改真实可用路径（上一版）', open: false, h:
+        '<div class="bpe-card"><h3>你报的三句话，和 Apple 官方工程师的实测逐条对上</h3><p><b>先认错：v2.4.0 的「自动小窗」是假成功。</b>Apple Developer Forums <b>819235</b>（DTS Engineer 回复）逐条验证过同一个场景：① <code>&lt;video playsinline autopictureinpicture&gt;</code> —— inline 播放态 WKWebView <b>根本不认这个属性</b>，只有「从 fullscreen 转后台」才生效；② <code>visibilitychange</code> 里 <code>requestPictureInPicture()</code> → <code>not triggered by user activation</code>；③ <code>visibilitychange</code> 里 <code>webkitSetPresentationMode("picture-in-picture")</code> → <b>不抛错、<code>webkitpresentationmodechanged</code> 也派发 picture-in-picture，但 PiP 窗口根本不渲染</b>；④ <code>await play()</code> 后再调 → 音频恢复、PiP 仍不开；⑤ 事件顺序是 <b><code>pause → visibilitychange hidden</code></b>。DTS 结论原文：没有用户交互就想自动切 PiP，需要 inline video 使用 <code>AVPlayerViewController</code>（<code>canStartPictureInPictureAutomaticallyFromInline</code> 是原生属性，网页无对应开关），<code>playsinline</code> 不会把视频交给它；<b>Fullscreen → background 自动 PiP 是确认可用的</b>。<br><br>对照你的实机：<b>「退出 Safari 会自动暂停」</b>= ⑤ 的 pause → hidden；<b>「控制中心倒能继续播放，但只能听个声」</b>= ④ 的音频会话恢复而 PiP 未渲染；<b>「换别的网页或退出 Safari 没有自动小窗」</b>= ②③ 的 WebKit 限制。另外还有一层：B 站网页走 <b>MSE / ManagedMediaSource（<code>blob:</code> 源）</b>，行业口径是「走 MSE 就等于放弃系统 PiP 管道，原生 HLS 才走 Apple 解码器与画中画路径」—— 这正是「过去用系统播放器（AVKit 原生播放器直接拿流）能后台小窗，现在留在网页 DOM 不行」的底层差别。<br><br><b>v2.4.0 自身的两个 bug 也一并认了</b>：<code>enter()</code> 把「静默接受」记成 <code>enters</code> 成功；<code>onHidden()</code> 一见 <code>v.paused</code> 就 <code>return</code>，连尝试都没做（而 iOS 那时必然已 pause）。<br><br><b>本版改成两条【真实可用】路径</b>：<b>A（默认）⧉ 手势内建窗</b> —— 画面右下低可见度小按钮 / Stay 菜单，在 <code>click</code> 的<b>同步栈</b>里调 <code>webkitSetPresentationMode</code>（Apple 官方《Adding PiP to Your Safari Media Controls》示例正是绑在按钮 click 里）。PiP 一旦在页面活跃时建立，之后换网页、退出 Safari、切 App 都由系统继续渲染与解码，控制中心也能连画面一起控制。<b>B（可选，默认关）临时恢复原生播放器</b> —— 放开 v2.1.3 起吞掉的 <code>webkitEnterFullscreen</code>，让 B 站全屏按钮进 AVPlayerViewController，由系统 fullscreen→后台自动 PiP；代价是那一层网页收不到触摸，本脚本所有触控倍速 / 亮度 / 音量手势失效。<code>bgAutoPip</code> 默认关并标成实验，开了也只记 <code>silentAttempts</code>、绝不计成功。<br><br><b>Media Session 一行没动</b>：你已证实控制中心「继续」能恢复声音，说明 v2.4.0 的 <code>play/pause/seek</code> handlers 与 metadata 生效；这版只补了 <code>onHidden</code> 里同步一次 <code>playbackState</code>，不主动 <code>play()</code> 抢用户意志、也不 <code>pause()</code>。<br><br><b>验证阶段自查修掉三个真 bug</b>：① <code>TouchV3.install()</code> 的 <code>webkitpresentationmodechanged</code> 回调误用块级 <code>self</code>，一进 WebKit PiP 就 <code>ReferenceError</code>；② 关总开关后 <code>scan()/render()</code> 又把 metadata 写回；③ <code>boot()</code> 的 <code>applyCfg()</code> 比 <code>install()</code> 更早，把脚本自己的 MediaMetadata 存成了「B 站原值」。这版又补了 ④ <code>enter()</code> 改成 WebKit 同步优先（标准 API 的 <code>await</code> 会把回退推出手势栈）、⑤ <code>timeupdate</code> 幂等补回被 B 站动态加上的 <code>disablepictureinpicture</code>；⑥ 关掉「⧉ 按钮」开关后要等 180ms 的 <code>scheduleScan()</code> 才隐藏，看起来像没反应，现在 <code>applyCfg()</code> 里即时同步 <code>updateBar()</code>。<br><br><b>如实边界</b>：这版不再承诺「切走那一刻自动变小窗」—— 那在 iPadOS 网页层被系统限制。要完全无感只有路径 B，但会牺牲触控。诊断「📋 后台诊断」新增 <code>platform.* / pip.silentAttempts / pausedAtHidden / srcKind</code>，会把限制、视频源类型、事件顺序、真实可用路径全部列出来。仍是模拟环境验证，不是真机。</p></div>' +
+        '' },
+      { t: 'v2.4.0 · 后台小窗 / 控制中心（已被更正）', open: false, h:
+        '<div class="bpe-card"><h3>你要复现的「系统播放器时代」三件事，网页层怎么做</h3><p><b>先说清一个概念：这版没有复活系统全屏。</b>你 v2.1.3 起要求「彻底弃用系统全屏，就在 B 站全屏基础上改造」，那层是 <code>webkitEnterFullscreen()</code>（把画面交给 AVKit 原生播放器、网页收不到触摸）。而<b>画中画 PiP 是完全另一条</b>：它是 <code>video.webkitPresentationMode = "picture-in-picture"</code> 或标准 <code>requestPictureInPicture()</code>，不需要进系统全屏，也不改 DOM 归属。所以「后台小窗」和「弃用系统全屏」可以并存，本地观看仍是网页内手势 + B 站网页全屏，只有切走时才浮小窗。<br><br><b>① 切别的网页 / 别的应用自动小窗</b>：监听 <code>visibilitychange</code> 与 <code>pagehide</code>（Safari 切标签 / 切 App 时至少来一个），视频确实在播就尝试进 PiP。两条 API 逐个试：<b>标准 <code>requestPictureInPicture()</code></b>（MDN：Safari on iOS 13.4+ 完全支持，但需要<b>瞬态用户激活</b>）→ 在 hidden 时手势可能已过期被拒 → 回退 <b>Apple 官方《Adding Picture in Picture to Your Safari Media Controls》的 <code>webkitSupportsPresentationMode("picture-in-picture") + webkitSetPresentationMode("picture-in-picture")</code></b>（Safari 自定义控件的画中画入口，比标准 API 宽松）。两者都失败就<b>如实提示 + 一键复制诊断</b>，绝不假装成功。PiP 一旦成功，由系统层继续解码播放，网页 JS 被挂起也不影响。<br><br><b>② 控制中心 / 锁屏显示正在播什么</b>：<code>MediaMetadata</code>（标题 / UP 主 / 封面，给 96/256/512 三种 sizes 让系统挑；数据全部取自页面 <code>__INITIAL_STATE__ / og:image / document.title</code>，不联网不编造）+ <code>playbackState</code> 随 play/pause 同步 + <code>setPositionState()</code> 每 900ms 更新进度。Media Session 自 Safari iOS 15 起支持 <code>setActionHandler</code>、Safari 14 起支持 <code>MediaMetadata</code>。<br><br><b>③ 控制中心点继续 / 暂停真能控制</b>：注册 <code>play / pause / seekbackward / seekforward / seekto</code>。<b>故意不注册 prev/next</b> —— iOS 锁屏对这两个动作有已知 quirk，而且会把 B 站分 P 误当成切曲。暂停走 <code>video.pause()</code>，正好命中 v2.1.6 起「pause 即用户意志、自动起播永久收手」，不会被脚本抢着重播；点继续走 <code>video.play()</code>。<br><br><b>④ 手势内预热（解决「切后台时手势已过期」）</b>：趁你点/滑画面、还有 transient activation 的那一刻，补齐 <code>playsinline / webkit-playsinline / allowpictureinpicture</code>、<code>removeAttribute("disablepictureinpicture")</code>（社区实现确认这个 JS 属性只读）、设 <code>autoPictureInPicture=true</code> 交给系统自动，并<b>提前注册 Media Session handlers</b>（GitHub issue #25 提到 iOS 锁屏对注册时机敏感）。<b>不闪进 PiP 再退出</b>，不制造突兀动画。<br><br><b>⑤ 真机前置（脚本做不到，必须你开）</b>：系统「设置 → 通用 → 画中画 → 自动开启画中画」打开，否则任何网页 PiP 都无效；地址栏 AA / 锁形 →「画中画」→ 允许（按域名记忆）；Safari 高级 → Experimental Features → <b>Media Session API</b> 保持开（你之前发的那批开关截图里就有），改完关标签页重开才生效；视频需播过至少一帧且<b>未静音</b>（静音媒体系统不显示 Now Playing 控件）。<br><br><b>验证阶段自查修掉两个真 bug</b>：<b>③ 关开关后 metadata 恢复不干净（真机也会遇到）</b>：<code>boot()</code> 末尾的 <code>applyCfg() → onCfgChange() → updateMetadata()</code> 比 <code>BgPlay.install()</code> 更早，若只在 <code>bindSession()</code> 里保存「B 站原 metadata」，就会把<b>我们自己刚写的 MediaMetadata</b> 当成原值存下来，关开关时又恢复成我们的标题封面。现在抽出幂等 <code>snapshot()</code>，任何写 <code>MS.metadata</code> 之前都先保存一次；诊断新增 <code>session.savedMeta</code>。<b>② 关掉后台播放总开关后 metadata 又被写回</b> —— <code>scan() / render()</code> 仍可能再次调用 <code>bindSession()</code>，而它只检查 <code>bgMediaSession</code>、没检查总开关 <code>bgPlay</code>，于是刚注销的控制中心信息又被重新注册。现在 <code>bindSession / syncState / setPosition</code> 三条路径统一先过 <code>cfg().on</code>，关开关后任何路径都不再写系统媒体信息。<b>① ：<code>TouchV3.install()</code> 里 <code>webkitpresentationmodechanged</code> 的回调误用了块级作用域的 <code>self</code>（该作用域内根本没有定义），以前没进过 WebKit 画中画所以一直没暴露；这版一进 PiP 就会抛 <code>ReferenceError</code>。已改成词法 <code>this</code> 并复用这个事件同步画中画诊断。<br><br><b>一行没动</b>：v2.3.10 白胶囊屏蔽与实例层音量接管、v2.3.9 音量巩固守卫、v2.3.8 竖条跟手、v2.3.7 轴向锁定 / 水平让行 seek / 长按提示 3 秒 / 10 秒锁定、v2.3.6 倍速闸门、v2.3.5 竖条 HUD、v2.3.4 放行 end、v2.3.3 window 兜底、短按完全放行、v2.2.0 触控撤回后的既有能力，以及搜索 / 三连 / D 开关 / 自动起播出声 / 音量记忆 / 键盘倍速 / F 网页全屏 / 专注屏蔽 / R 刷新 / 5 页签含打赏。仍是单 keydown / 单 keyup / 单 Observer，新增的可见性监听只绑一次、手势预热复用 window 前置桥。<br><br><b>如实边界</b>：标准 PiP 的用户激活要求、iOS 后台挂起网页 JS、以及系统是否采纳网页 Media Session，都由 iPadOS / Safari 版本决定，脚本只负责正确调用 API 并如实报告结果。若 <code>pip.lastError</code> 是 <code>standard: NotAllowedError</code> 且 <code>webkit</code> 也失败，说明系统权限或 DRM/站点限制，网页层无法绕过 —— 诊断会把原因、命中属性、已注册 handlers 全部列出来。仍是模拟环境验证，不是真机。</p></div>' +
+        '' },
+      { t: 'v2.3.10 · 屏蔽白胶囊 / 直接接管网页音量', open: false, h:
+        '<div class="bpe-card"><h3>按你的判断改：白胶囊是 B 站的，不是系统的</h3><p><b>① 先收回上一版那句「网页无权改」</b>：你判断它是 B 站播放器的 DOM，这版就按 DOM 处理，不再拿系统层当挡箭牌。三层屏蔽：<b>document 级 CSS</b>（不是 shadow 里的样式）命中 <code>.bpx-player-volume-hint / [class*="volume-toast"] / [class*="volume-hud"]</code> 等候选，任何时刻动态插入都立刻 <code>display:none!important</code>；<b>复用现有那一个 MutationObserver</b> 重扫（内部 120ms 节流，不新增 Observer）；<b>手势窗口内 80ms 短轮询</b>，专治「松手那一刻才插入」。扫描按「类名或 <code>🔊NN%</code> 文案 + 在播放器附近 + 小尺寸浮层」三重限定，我们自己的竖条在 shadow root 里，<code>document.querySelectorAll</code> 天然扫不到，绝不会误伤。诊断 <code>volHud.killed / samples</code> 会告诉你实际命中了几个、命中了什么。<br><br><b>② 直接接管网页音量</b>：v2.3.9 是「B 站写回之后再由 volumechange 纠正」，属于事后补救；这版在 <code>&lt;video&gt; 实例</code>上定义 own <code>volume</code> 描述符（Web IDL 属性 <code>configurable</code>，实例属性遮蔽原型，只影响这一个视频、不污染全局），守卫窗口内把 B 站 / 任何外部对 <code>video.volume</code> 的写入<b>直接吞掉</b>，从根上就没有「弹回 50%」这一步。脚本自身写入靠 <code>CORE.applyingVolume</code> 放行；守卫期外完全放行，B 站音量滑块、系统侧键、控制中心照常生效。若某 WebKit 版本拿不到原型描述符，自动回退 v2.3.9 的守卫，诊断 <code>volumeOwned=false / ownFail</code> 会如实写原因。<br><br><b>③ 三层都不会误伤</b>：CSS 只匹配 <code>hint/tip/toast/hud/notice/indicator/bubble</code> 这类 HUD 类名，不匹配 <code>slider/bar/btn/ctrl/box</code>，B 站真正的音量滑块保留；扫描排除所有 <code>bpe-</code> 自身元素；接管只在守卫窗口（拖期间 + 松手 900ms + 可选 pin）内生效。<br><br><b>一行没动</b>：v2.3.9 音量巩固守卫与记忆同步、v2.3.8 竖条跟手（去 CSS 过渡 / 定轴点基线 / place 缓存）、v2.3.7 轴向锁定 / 水平让行 B 站 seek / 长按提示 3 秒 / 10 秒锁定、v2.3.6 统一倍速闸门、v2.3.5 竖条 HUD / 1/5 阈值、v2.3.4 放行 end、v2.3.3 window 兜底收手、短按完全放行，以及搜索 / 三连 / D 开关 / 自动起播出声 / 音量记忆 / 键盘倍速 / F 网页全屏 / 专注屏蔽 / R 刷新 / 5 页签含打赏。<br><br><b>如实边界</b>：若 <code>volHud.killed=0</code> 且白胶囊仍显示，说明它确实是系统层（网页层隐藏不了）—— 但这次不再两手一摊：element 音量仍由我们接管，松手不回弹，那个数字只是系统层的显示。仍是模拟环境验证，不是真机；把「📋 触控诊断」回传，看 <code>volHud.killed / volumeOwned / volWritesBlocked</code> 就能定。</p></div>' +
+        '' },
+      { t: 'v2.3.9 · 松手音量不回弹 / 承认两层音量', open: false, h:
+        '<div class="bpe-card"><h3>先认两个错，再按你的实机证据修</h3><p><b>① 旧结论错了</b>：脚本从 v1.6.3 起一直写「iPad Safari 的 <code>video.volume</code> 只读恒为 1，网页无权调音量」，所以早期右半屏只给「请用侧键」提示。你这次明确说「拖咱的拉低到 20%，<b>实际的音量确实跟手降了</b>」—— 这台 iPad 上它<b>可写且生效</b>，旧判断不成立。诊断与文案已更正为实测口径。<br><br><b>② v2.3.8 方向错了</b>：我断言白底「🔊」是 B 站按位移补算的网页 HUD，于是掐真实 end、派两个「坐标=起点」的 <code>touchend</code>/<code>pointerup</code> 副本。实机结果：<b>白底 HUD 照样显示</b>（净化无效），而且<b>「这回一放手就回弹」</b>是上一版才出现的 —— 那两个副本让 B 站完整走完手势结算，结算里包含「把 <code>state.volume</code> 写回 <code>video.volume</code>」。<b>本版把 <code>touchNeutralizeNativeEnd</code> 强制关掉</b>（迁移写回，不是缺省补值），end 回到 v2.3.4 的完整放行，代码留作对照回退。<br><br><b>③ 两层音量必须分清</b>：<code>实际听到的音量 = 系统 / B 站 state 音量（白底 🔊 HUD，侧键与控制中心管）× 网页 <code>element.volume</code>（我们写的）</code>。脚本只管后者，<b>无权改白底那个数字</b>；你描述「显示系统的音量是 50%，我拖咱的拉低到 20%」正是两层并存。所以本版<b>不再承诺消掉白底 HUD</b>，只保证「松手后实际音量保持你拖到的值」。<br><br><b>④ 回弹真因与修法</b>：拖期间每帧写 <code>v.volume = 0.2</code> → 声音跟手降；松手时 B 站按自己 <code>state.volume = 0.5</code> 结算并回写 → 弹回 50%。你说「<b>得拖到一个音量保持一会儿才有概率把系统的显示变成和我们一致</b>」，说明它的采纳是延迟/防抖的。现在把这个手工 workaround 变成确定性行为：<b>松手后钉住 900ms</b>（可配 200–3000），<code>volumechange</code> 一被改回立刻写回目标（用 <code>applyingVolume</code> 屏蔽，不污染 v1.6.3 记忆监听器），并在 0/120/300/600ms 做<b>幂等复查</b>（值没变一次都不写，不制造事件风暴）；同时把 <code>CFG.preferredVolume</code> 同步成目标，防守卫撤后 <code>applyPreferredVolume()</code> 又拿旧记忆值写回来。<b>守卫期外完全放行</b>：B 站音量滑块、系统侧键、硬件键都照常生效。另有可选「持续钉住」应对延迟超过窗口的机型，默认关。<br><br><b>验证阶段自查出并修掉的三个真 bug</b>：① <code>install()</code> 里守卫绑定误用了块级作用域的 <code>self</code>，真机上每次 <code>volumechange</code> 都会抛 <code>ReferenceError</code> —— 已改用词法 <code>this</code>，并补了懒绑定（SPA 换 <code>&lt;video&gt;</code> 元素时 <code>install()</code> 会提前 return，新元素也必须绑上）。② v1.6.3 的音量记忆监听器注册更早，会把「B 站回写的 0.5」抢先记成用户意图，守卫撤后 <code>applyPreferredVolume()</code> 又拿它写回来 → 真机二次回弹；现在守卫期内屏蔽 <code>volumechange</code> 来源的记忆（脚本自己同步 <code>preferredVolume</code> 不受影响），并专门模拟 <code>playing</code> 事件验证不再二次回弹。③ 关掉「持续钉住」后旧的 pin 守卫会残留，导致音量记忆被永久屏蔽；现在下次手势立即撤干净。<br><br><b>一行没动</b>：v2.3.8 竖条跟手（去两条 CSS transition / 定轴点基线 / <code>place()</code> 几何缓存）、v2.3.7 轴向锁定 / 水平让行 B 站 seek / 长按提示 3 秒 / 10 秒自动锁定、v2.3.6 统一倍速闸门、v2.3.5 竖条 HUD / 上滑升档 / 1/5 阈值、v2.3.4 放行 end、v2.3.3 window 兜底收手、短按完全放行，以及搜索 / 三连 / D 开关 / 自动起播出声 / 音量记忆 / 键盘倍速 / F 网页全屏 / 专注屏蔽 / R 刷新 / 5 页签含打赏。<br><br><b>如实边界</b>：白底 HUD 的数字仍会显示系统层的值，网页层改不了；若 B 站在守卫窗口之后仍周期性回写，请开「持续钉住」。守卫期内（默认 900ms）若你去拖 B 站自己的音量滑块，会被暂时纠正回目标值——这是刻意取舍，窗口过后即完全让行。仍是模拟环境验证，不是真机。</p></div>' +
+        '' },
+      { t: 'v2.3.8 · 松手不弹原生音量 HUD / 竖条跟手', open: false, h:
+        '<div class="bpe-card"><h3>两个都查到具体代码位置，不是再猜一层拦截</h3><p><b>① 松手后弹「🔊 100%」</b>：你截图那个白底胶囊<b>不是脚本的竖条</b>（我们显示的是透明 7px 细轨 + ☀/🔊 + <code>80%</code>，且放在画面外/边缘），是 B 站播放器自己的音量 HUD。关键是它<b>只在松手那一刻弹、滑动期间不弹</b> —— 说明 B 站手势识别器是 <code>down 记起点 → up 按「起点→终点总位移」补算一次</code>。时间线对得上：v2.3.2 当初为防这种补算掐 end → 状态机卡死（松手后 hover 还调音量、左右拖变 seek）；v2.3.4 改成放行 end 修了卡死，补算就漏出来；v2.3.7 水平让行后识别器重新活跃，于是这次复现。<br><br><b>修法不是回到掐 end</b>（会重演卡死），而是：垂直手势的 end 用 <code>stopImmediatePropagation()</code> 掐掉真实事件（B 站拿不到终点坐标），<b>同步派发一个「坐标 = 手势起点」的净化 <code>touchend</code> + <code>pointerup</code></b>，bubbles 走完整链路 —— B 站状态机照常清零，但算出的位移 ≈ 0，不会弹音量 HUD。净化副本打 <code>__bpeCleanEnd</code> 标记，window guard 与 <code>on()</code> 都跳过，不会重复结算。同一次物理抬起的两个兼容 end 用 260ms 短窗口一起净化；新手势 <code>pointerdown</code> 立即作废旧窗口，松手后马上再点一下画面不会被误伤。<b>刻意不调 <code>preventDefault</code></b>，不抑制浏览器合成 click；短按与水平 seek 完全不进这条路径，v2.3.4 / v2.3.7 成果原样保留。设置页有「松手不弹 B 站原生音量 HUD」开关可回退。<br><br><b>② 亮度/音量条「不太跟手，慢半拍」</b>：两处真因。其一，<code>.bpe-tv-track > i</code> 写着 <code>transition:height .07s linear</code>、<code>.bpe-tv-level</code> 写着 <code>transition:opacity .1s</code> —— 连续 move 约每 16ms 一帧，过渡被不断重启，填充条永远在追赶上一个目标值，肉眼就是滞后。现在两条全部 <code>transition:none</code>，手势 HUD 改硬切。其二，v2.3.7 定轴后基线取的是 <b>touchstart 的 y</b>，会把前面 28px 死区一次性补算进第一帧 → 先没反应、然后突然跳一大截。现在基线改为<b>「定轴那一点的 y」</b>，死区就当死区（也符合「别太灵敏」），每一帧即时响应、无跳变。另外 <code>place()</code> 加了几何缓存，同一矩形内不再每帧重写 3 个元素的 <code>style.cssText</code>。<br><br><b>一行没动</b>：v2.3.7 轴向锁定 / 水平让行 B 站 seek / 长按提示 3 秒 / 10 秒自动锁定、v2.3.6 统一倍速闸门（一次换档只写 1 次）、v2.3.5 竖条 HUD / 上滑升档 / 1/5 画面锁定阈值、v2.3.4 放行 end（状态机不卡死）、v2.3.3 window 兜底收手与 HUD 可见性、短按完全放行，以及搜索 / 三连 / D 开关 / 自动起播出声 / 音量记忆 / 键盘倍速 / F 网页全屏 / 专注屏蔽 / R 刷新 / 5 页签含打赏。<br><br><b>如实边界</b>：净化的是「B 站在 JS 里按位移补算」的网页 HUD；若那个胶囊来自 iPadOS 系统级音量层或 B 站在 window 捕获层比脚本更早注册的监听，网页层仍可能漏出一条，诊断里 <code>nativeEndNeutralized / cleanEndDispatched</code> 可确认净化有没有执行。仍是模拟环境验证，不是真机。</p></div>' +
+        '' },
+      { t: 'v2.3.7 · 长按提示 3s / 轴向锁定 / 左右滑交还 B 站进度', open: false, h:
+        '<div class="bpe-card"><h3>一次手势只干一件事：按下先定轴，松手前不切换</h3><p><b>① 长按提示改回来了，但按你这轮的简洁版</b>：进入长按立刻显示一行「<b>2×倍速中</b>」，没有上下划说明、没有进度条，<b>显示 3 秒</b>自动收起；<b>按住 10 秒</b>才自动锁定（锁定提示也只显示 3 秒）。上滑每换一档再显示一次「2.5×倍速中」并重新计时；下滑仍提示「松开锁定倍速 / 松开还原倍速」。<b>松手立刻消失</b>优先级高于 3 秒定时器。<br><br><b>② 「左右滑屏幕不能调进度了？」—— 是我掐断的，不是 iPad 的问题。</b>v2.3.2 为修「滑左侧连原生音量一起调」，对手势激活后的<b>所有</b> <code>move</code> 调了 <code>stopImmediatePropagation()</code>；B 站自己的水平 seek 识别器要靠这批 move 才能拖进度条，一个都收不到，进度自然不动。v2.3.4 只放行了 <code>up</code>，move 仍全掐。现在<b>水平手势整批完全放行</b>：不 <code>preventDefault</code>、不 <code>stop</code>、脚本也不自己写 <code>currentTime</code>，进度交还 B 站原生手势（不与它打架）。<br><br><b>③ 「别左右滑手稍微偏上偏下就调开亮度音量」</b>：旧版只要 <code>|dy|&gt;10 或 |dx|&gt;10</code> 就置 <code>s.moved=true</code>，随即按起点左右分屏进亮度/音量 —— 水平滑动里一点上下抖动就误判。现在按下后<b>先定轴</b>：主轴位移 ≥ <code>axisPx</code>（默认 28px）且 主轴 &gt; 副轴 × <code>axisRatio</code>（1.35）才定性；未达阈值或斜向模糊一律放行（短按 click 完全不受影响）。<b>一旦定成 h / v 就写进 <code>s.axis</code>，直到松手都不再改变</b> —— 「要调啥就调啥，松手之前不能调别的」。长按进倍速直接锁死垂直轴，横移也不会切成 seek。<br><br><b>④ 「别太灵敏」</b>：亮度/音量每像素变化分母从 260 提到 <b>420</b>（同样滑 100px，亮度变化 0.38 → 0.24），定轴阈值也从 10px 提到 28px。五个参数都在「⚙ 功能开关 → 🖐 移动端同款触控」可改。<br><br><b>⑤ window 兜底同步改</b>：旧版用 10px + <code>s.moved</code> 预判 active，会漏掉定轴那第一个 move（阈值已 28px），B 站 document 层先收到一次垂直 move 又弹原生音量条；现在每个按下的 move 都交给 <code>on()</code> 统一判轴，未定轴/水平时它自己会完全放行。<br><br><b>一行没动</b>：v2.3.6 统一倍速闸门（一次换档只写 1 次）、v2.3.5 竖条 HUD / 上滑升档 / 1/5 画面锁定阈值、v2.3.4 放行 end（B 站状态机不卡死）、v2.3.3 window 兜底收手与 HUD 可见性、v2.3.2 下滑锁定/解除语义、短按完全放行，以及搜索 / 三连 / D 开关 / 自动起播出声 / 音量记忆 / 键盘倍速 / F 网页全屏 / 专注屏蔽 / R 刷新 / 5 页签含打赏。<br><br><b>如实边界</b>：脚本只负责把水平 move 交还 B 站；若某版 B 站网页播放器本身没有水平 seek 手势，水平滑动仍不会动进度（不伪造 seek）。诊断里 <code>seekPass</code> 是放行次数，<code>axis</code> 是本次定轴结果。</p></div>' +
+        '' },
+      { t: 'v2.3.6 · 换档卡顿：查到 WebKit 平台 bug，把一次换档压到只写 1 次', open: false, h:
+        '<div class="bpe-card"><h3>「不是按了没反应，是画面暂停那样的卡顿」—— 这次查到官方 bug 单</h3><p><b>平台结论（消不掉单次那一下）</b>：WebKit Bugzilla <b>326890</b>（2026-10-08，Safari 26 / iOS 27）原文：<i>“In WebKit, every playbackRate change on MediaSource video with an audio track stops frame presentation and freezes currentTime for about 300 ms.”</i> 同一报告说 Chrome 继续播放不暂停，并已提交修复 PR <code>WebKit/WebKit#76386</code>（状态 NEW）。同版本 Bug <b>323487</b>（2026-09-04）也写：<i>“When changing the playback speed … a weird (but short ~0.2-0.4s) lag/stutter/pause each time”</i>。B 站网页是 MSE/DASH + 音轨，正好命中。另有 WebKit 230858（iOS 15 回归）记录反复 seek + 写 rate 会「video freezes completely / media failed to decode」，commaai/connect PR 595 记录「Each write hits the audio decoder … iOS Safari 音频 cracked / stuttered」，其修法正是反转成<b>尽量不碰 media element</b>。<br><br><b>所以这版不吹「修好了不卡」</b>：单次换档那 ≈300ms 是平台下限，网页层无权绕过。能修的是脚本自己造成的<b>一次换档写 2~5 次</b>：① <code>TouchV3.probeRates()</code> 每次「📋 触控诊断」连写 4 档 + 还原 = 5 次冻结（≈1.5 秒），<code>GestureLayer.rateTest()</code> 还在 install 时自动写 2 次 → 全改成只读探测，一次不写；② <code>ratechange → Rate.correct()</code> 会在写入后再写一次 → 写入后设 420ms 静默期挡掉；③ <code>restoreRate()</code> 绑在 loadedmetadata / canplay / playing 等 6 个事件上，换档触发媒体事件就又写回一次 → 静默期内跳过，且已是目标档位直接 return；④ 触控上滑每跨一档同步直写、失败还回滚写 → 统一走 <code>Rate</code> 闸门；⑤ 连续按 <code>] ] ]</code> 或快速上滑跨档 → 160ms 合并窗口内只写最后一次。<br><br><b>正确性保障（含两处自查修复）</b>：手动「↩︎ 回 1×」、官方长按 3× 松开、解除锁定仍走 <code>immediate</code> 不延迟（v1.7 铁律不变）；静默期结束时只在「倍速确实被改回」时复核一次，正常换档不会多写；写入前同步 <code>Rate.intent</code> 并置 <code>CORE.touchRate.active</code>，v2.3.5 修的「一直按着回原速」不会复发。<b>自查 ①</b>：合并窗口内 <code>v.playbackRate</code> 还是旧值，<code>rateStep()</code> 若按它算下一档，连按 <code>] ] ]</code> 会三次都算出 1.25× —— 已改用 <code>Rate.intent</code> 作基准，连按能正常累积到 1.75× 且只写一次。<b>自查 ②</b>：长按进入 / 松手结算若也进 160ms 合并，会变成 280+160=440ms 才有反应（又被当成「长按没用」）—— 这两处改走 <code>immediate</code>，只有上滑连续跨档进合并窗口。<br><br><b>两个可选实验项</b>：<code>preservesPitch / webkitPreservesPitch = false</code>（MDN，2023-12 起广泛可用）关掉 time-stretch 重采样，可减轻音频侧开销，但声音会变尖，学习类视频默认<b>关</b>；「换档瞬间临时静音」默认关、不承诺有效。两者都<b>不能</b>消除 Bug 326890 的帧冻结。<br><br><b>一行没动</b>：v2.3.5 竖条 HUD / 上滑升档 / 1/5 锁定阈值、v2.3.4 放行松手事件、v2.3.3 HUD 可见性与 window 兜底、v2.3.2 下滑锁定 / 解除语义、短按完全放行，以及搜索 / 三连 / D 开关 / 自动起播出声 / 音量记忆 / 键盘倍速 / F 网页全屏 / 专注屏蔽 / R 刷新 / 5 页签含打赏。<br><br><b>查证来源</b>：bugs.webkit.org/show_bug.cgi?id=326890、?id=323487、webkit.org/b/230858、webkit.org/b/275665（移除音轨后播放正常）、MDN HTMLMediaElement.preservesPitch、Apple Developer HTMLMediaElement.playbackRate、github.com/commaai/connect/pull/595。</p></div>' +
+        '' },
+      { t: 'v2.3.5 · 极简竖条 HUD / 修倍速拖动三处', open: false, h:
         '<div class="bpe-card"><h3>UI 按你要求重做，三个拖动 bug 都查到代码级原因</h3><p><b>① 极简 HUD</b>：亮度 / 音量各一条<b>竖细轨</b>（宽 7px）+ emoji（☀ / 🔊）+ XX%，无底框无副标题，<code>opacity:.52</code>；<b>松手或松鼠标立刻消失</b>（直接关 display，不再等 1.6s 淡出）。非全屏按 <code>video.getBoundingClientRect()</code> 把竖条放<b>画面矩形外侧</b>、倍速提示放画面上方外侧；全屏则竖条贴屏幕左右边缘、倍速放<b>画面顶端</b>。<br><br><b>② 长按提示精简</b>：长按本身<b>不显示任何东西</b>（去掉「⚡ 2× 临时倍速 + 上滑调高…」大段文字和进度条）；上滑每变一个档位只闪一行「<code>2.5×</code>」，下滑后提示「<b>松开锁定倍速</b>」/「<b>松开还原倍速</b>」，都是低可见度纯文字。<br><br><b>③ 上滑无法升高档位</b>：旧版用 <code>C.rates</code>（<code>touchV3Rates=[0.5,1,1.5,2]</code>）算档位，而长按目标已是 <b>2× = 该表最后一档</b>，<code>indexOf(2)+steps</code> 永远被 clamp 回 2× —— 一档都升不了。改用全局 <code>CFG.rateList</code>（0.5~5 共 11 档），并记<b>固定基准 <code>rateIdx0</code></b>；旧版拿「会变的 <code>s.rate</code>」做 indexOf 基准，steps=2 时会连跳两档，也一并修掉。<br><br><b>④ 一直按着还会回到原速</b>：<code>TouchV3.writeRate()</code> 同步写 <code>v.playbackRate</code> 会触发 <code>ratechange → Rate.correct()</code>，而 <code>Rate.intent</code> 是上一次<b>键盘倍速</b>留下的旧档位（常为 1×）；correct() 见 2× ≠ 1× 就在 setTimeout 里改回 1×。v2.1.2 还删了 correct() 里的触控让位判断，更没东西挡。现在写入前把 <code>Rate.intent</code> 同步成触控目标、清 <code>Rate.pending</code>，并给 <code>CORE.touchRate.active</code> 打标记让 <code>restoreRate()</code>（playing / loadedmetadata 等 6 个事件）在触控期间让位，松手时撤销。<br><br><b>⑤ 锁定检测太灵敏</b>：下滑锁定 / 解除阈值从固定 44px 改为<b>画面高度 1/5</b>（≈117px），上滑每档步进改为<b>画面高度 1/8</b>（≈73px），都按 video 矩形实时算，不再一抖就触发。<br><br><b>一行没动</b>：v2.3.4 松手事件放行（B 站状态机不卡死）、v2.3.3 HUD <code>.on</code> 可见性与 🔔 测试提示层、window 兜底收手、v2.3.2 下滑锁定 / 解除语义与百分比数值、capture+passive:false、短按完全放行，以及搜索 / 三连 / D 开关 / 自动起播出声 / 音量记忆 / 键盘倍速 / F 网页全屏 / 专注屏蔽 / R 刷新 / 5 页签含打赏。</p></div>' +
         '' },
       { t: 'v2.3.4 · 放行松手事件，B 站状态机不再卡死', open: false, h:
@@ -5826,6 +7544,7 @@ const DEFAULTS = {
     lastRenderedTab = activeTab;
     const dockMini = $$('.bpe-dock .bpe-mini', sr).find(b => b.dataset.act === 'cmd:learn');
     if (dockMini) dockMini.classList.toggle('on', !!CFG.learnMode);
+    syncDockKeys();   // v2.5.1：录完键后一级菜单热键即时刷新
   }
   /* v1.9.1 打开设置的唯一入口：先把所有「会盖在设置页上」的浮层收干净。
      ① 二级 dock（截图里右侧一列 ⚡倍速/⛚全屏/… 压住正文的元凶）
@@ -5876,7 +7595,8 @@ const DEFAULTS = {
       if (act.startsWith('cmd:')) { e.stopPropagation(); return Bus.exec(act.slice(4)); }
       /* v1.9 浮层搜索：分类 / 联想 / 结果 / 历史 / 热搜，全部按索引或枚举取，
          不接受任意 URL 字符串，避免把外链拼进 data-act。 */
-      if (act.startsWith('fstab:')) { e.stopPropagation(); return fsTab(act.slice(6)); }
+      if (act.startsWith('fssort:')) { e.stopPropagation(); CORE.floatSearch.sort = act.slice(7); fsRenderBody(); return; }
+    if (act.startsWith('fstab:')) { e.stopPropagation(); return fsTab(act.slice(6)); }
       if (act.startsWith('fssug:')) { e.stopPropagation(); return fsPickSuggest(Number(act.slice(6))); }
       if (act.startsWith('fsopen:')) {
         e.stopPropagation();
@@ -6238,6 +7958,8 @@ const DEFAULTS = {
     findVideo();
     GestureLayer.apply('scan');      // v2.1.7：画面/控件/全屏变化后重建手势区
     TouchV3.install();               // v2.3.0：绑播放器元素（非根），显式 passive:false
+    /* v2.4.0：后台播放 / 画中画 / Media Session，换视频自动重绑 */
+    try { BgPlay.install(findVideo()); } catch (e) {}
     if (CFG.enabled && CFG.autoPlay) autoPlayVideo(findVideo());  // 晚插入的 video 也能自动起播
     fillWatchdog();   // B 站切全屏会改 DOM 类名，这里比 900ms 定时更及时
     if (CFG.enabled && (CFG.learnMode || CFG.showBlockButtons)) scanCards();
@@ -6248,10 +7970,21 @@ const DEFAULTS = {
     try {
       if (records && records.length && records.every(r => GestureLayer.contains(r.target))) return;
     } catch (e) {}
+    /* v2.3.10：复用同一个 Observer 重扫白胶囊（内部 120ms 节流），不新增 Observer */
+    try { VolHud.onMutation(); } catch (e) {}
+    /* v2.4.0：同一个 Observer 顺带刷新控制中心元数据（内部 500ms 节流） */
+    try { BgPlay.updateMetadata(); } catch (e) {}
     scheduleScan();
   });
   function applyCfg() {
     document.documentElement.classList.toggle('bpe-enabled', !!CFG.enabled);
+    /* v2.3.10：白胶囊屏蔽开关即时注入 / 撤销 document 级 CSS */
+    try { VolHud.apply(); } catch (e) {}
+    /* v2.4.0：后台播放开关即时生效 */
+    try { BgPlay.onCfgChange(); } catch (e) {}
+    /* v2.4.1：⧉ 按钮显隐依赖开关，applyCfg 里立刻同步（scheduleScan 有 180ms
+       延迟，只靠它会让「关掉按钮」看起来没反应） */
+    try { updateBar(); } catch (e) {}
     GestureLayer.apply('applyCfg');  // v2.1.7：开关改动即时生效
     // v2.1.2：关掉「左亮度 / 右音量」后立刻还原画面滤镜，不留残影
     if (!CFG.touchBrightVolume && document.documentElement.classList.contains('bpe-bright')) {
@@ -6292,7 +8025,11 @@ const DEFAULTS = {
         GM_registerMenuCommand('🎯 切换学习模式', () => Bus.exec('learn'));
         GM_registerMenuCommand('👁 弹幕显示开关（切换并验证状态）', () => Bus.exec('danmu'));
         GM_registerMenuCommand('📋 复制起播诊断（为什么没自动播）', () => Bus.exec('autoPlayDiag'));
-        GM_registerMenuCommand('📋 复制音量诊断（记忆值 / 系统音量边界）', () => Bus.exec('volumeDiag'));
+        GM_registerMenuCommand('⧉ 立即小窗播放（手势内建窗，切走继续）', () => Bus.exec('bgPip'));
+GM_registerMenuCommand('↩ 退出画中画小窗', () => Bus.exec('bgPipExit'));
+GM_registerMenuCommand('📋 复制后台播放诊断（PiP / 控制中心）', () => Bus.exec('bgDiag'));
+GM_registerMenuCommand('🚫 立即扫描并屏蔽音量胶囊', () => Bus.exec('volHudKill'));
+GM_registerMenuCommand('📋 复制音量诊断（记忆值 / 系统音量边界）', () => Bus.exec('volumeDiag'));
         GM_registerMenuCommand('🔊 立即解除静音（用记忆音量）', () => Bus.exec('unmuteNow'));
         GM_registerMenuCommand('📋 复制刷新诊断（R 键为什么没刷新）', () => Bus.exec('refreshDiag'));
         GM_registerMenuCommand('🎬 立即尝试自动起播', () => Bus.exec('autoPlayNow'));
@@ -6322,6 +8059,8 @@ const DEFAULTS = {
       const first = !CORE.gestureSeen;
       CORE.gestureSeen = true;
       CORE.lastGestureAt = Date.now();
+      /* v2.4.0：手势内预热画中画属性与 Media Session（还有 transient activation） */
+      try { BgPlay.prewarm(); } catch (_) {}
       const v = findVideo();
       if (!v) { U.lastReason = '未找到视频'; return; }
       // 收紧：只在明确的静音 / 音量控件上让行，旧版 [class*="mute"] 宽通配
@@ -6435,7 +8174,7 @@ const DEFAULTS = {
     render();
     updateBar();
     CORE.booted = true;
-    LOG('Boot', 'BilibiliPlus Xi/Elio v' + CORE.version + ' 启动完成 · 极简竖条 HUD / 倍速拖动修复 · 短按仍放行 · Stay 能力 ' + Object.keys(CAP).filter(k => CAP[k]).length + '/9');
+    LOG('Boot', 'BilibiliPlus Xi/Elio v' + CORE.version + ' 启动完成 · 全局选中限制 / 控制台避右下角 / 设置居中 / 一级菜单热键 · 短按仍放行 · Stay 能力 ' + Object.keys(CAP).filter(k => CAP[k]).length + '/9');
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot, { once: true });
   else boot();
