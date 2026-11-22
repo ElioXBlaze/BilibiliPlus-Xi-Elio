@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BilibiliPlus Xi/Elio · 哔哩哔哩 iPad 增强套件
 // @namespace    https://bilipad.local/suite
-// @version      2.0.5
+// @version      2.3.5
 // @description  iPad Pro / iPadOS / Safari / Stay 专用单脚本：零导航页内搜索、官方接口三连（无币自动补赞藏）、弹幕显示开关按真实状态载体校验（发弹幕完全交还 B 站官方输入框，不劫持 A / Shift+Enter）、R 键刷新推荐改为「点击后验证卡片真的变化」（不再假成功）、进播放页自动起播（静音起播 + 首次手势恢复音量 + 官方播放按钮兜底）、扩展倍速、全屏智能铺满、可避让专注条、分区与 UP 主屏蔽、无水印直链、截帧。单实例 + 命令总线 + 共享 Observer。
 // @author       Xi/Elio X. Blaze
 // @match        https://www.bilibili.com/*
@@ -16,7 +16,7 @@
 // @grant        GM_download
 // @grant        GM_xmlhttpRequest
 // @inject-into  content
-// @run-at       document-idle
+// @run-at       document-start
 // ==/UserScript==
 
 (function () {
@@ -30,8 +30,45 @@
     console.warn('[BiliPad] 检测到重复实例，本次注入已跳过，避免倍速/快捷键/样式被二次覆盖。');
     return;
   }
+  /* ============================================================
+   * v2.1.6 · 前置桥（真正解决「触控一个手势都没有」的结构修复）
+   * ------------------------------------------------------------
+   * 用户连续五版反馈无效，并说「左右上下滑动都是音量」—— 那其实是
+   * B 站播放器自己的手势 HUD，说明触摸被 B 站完整消费了。复盘 v2.1.5：
+   * 监听确实挂到了 window 捕获，但脚本是 @run-at document-idle 注入，
+   * B 站的脚本先加载、先在同一 window 节点上注册；DOM 事件对同一节点的
+   * 监听按注册顺序执行，B 站若调 stopImmediatePropagation()，我们后注册的
+   * window 监听照样收不到。三层、几何热区、ShadowRoot 都白改。
+   *
+   * 这版把 @run-at 改成 document-start，并在 IIFE 最前面、B 站任何脚本
+   * 执行之前，把 window 捕获监听占好坑。此时 Touch / CFG 还没初始化，
+   * 所以桥只做转发：事件来了查 window.__BPE_H__，boot 完成后挂上真正的
+   * 处理器；boot 前的触摸只计数不处理（刚加载文档时本来也不会有手势）。
+   * 这就是「我们的监听先于 B 站」的唯一可靠做法。
+   * ============================================================ */
+  window.__BPE_EARLY__ = { registered: true, at: Date.now(), events: 0, beforeBoot: 0 };
+  (function installEarlyBridge() {
+    const E = window.__BPE_EARLY__;
+    const TOUCH = ['pointerdown', 'pointermove', 'pointerup', 'pointercancel',
+      'touchstart', 'touchmove', 'touchend', 'touchcancel'];
+    const GESTURE = ['pointerdown', 'touchstart', 'touchend', 'mousedown', 'keydown'];
+    const forward = (t, e, kind) => {
+      E.events++;
+      const h = window.__BPE_H__;
+      if (!h) { E.beforeBoot++; return; }
+      try { if (kind === 'gesture') h.gesture(e, 'early'); else h.touch(t, e); }
+      catch (err) { /* 前置层绝不抛错影响页面 */ }
+    };
+    // v2.2.0：触控通道整套不注册。此处执行早于 TOUCH_OFF 常量定义，
+    // 故用字面量 false；GESTURE 通道只是 passive 计数 + 自动解除静音，
+    // 不 preventDefault / 不 stopPropagation，不会碰 B 站任何原生交互。
+    if (false) TOUCH.forEach(t => window.addEventListener(t, e => forward(t, e, 'touch'),
+      { capture: true, passive: t !== 'touchmove' }));
+    GESTURE.forEach(t => window.addEventListener(t, e => forward(t, e, 'gesture'),
+      { capture: true, passive: true }));
+  })();
   const CORE = window[NS] = {
-    booted: false, version: '2.0.5', started: Date.now(), loginDiag: null,
+    booted: false, version: '2.3.5', started: Date.now(), loginDiag: null,
     modules: new Map(), logs: [], hiddenCount: 0,
     // v1.7 倍速长按：rateHold=[ / ] 的按下状态；rightHold=右方向键按下状态；
     // officialHold=B 站官方「长按右方向键 3×」生效期间（脚本此间绝不写 playbackRate）。
@@ -62,6 +99,28 @@
     volSettable: null, applyingVolume: false, lastGestureAt: 0, lastMuted: null,
     volDiag: null, volSaveTimer: null,
     results: [], switchDiag: null, refreshDiag: null, refreshLock: false,
+    // v2.1.0 触控倍速 / v2.1.2 移动端手势：
+    // active=倍速手势进行中；touchDiag=最近一次结算；touchLock.rate=0 表示未锁定。
+    touchRate: { active: false, session: 'idle', rate: 1 }, touchDiag: null,
+    touchLock: { rate: 0 }, bright: { value: 1 }, touchZoneEl: null,
+    // v2.1.4：不再自建全屏容器；sysFullBlocked 记录系统全屏被吞次数（诊断用）
+    sysFullBlocked: 0, fsRedirecting: false, apUnmuteProbing: null,
+    // v2.1.5：事件到达探针 —— 真机「啥也没有」时一眼看清事件到底有没有进来、从哪层进来
+    touchProbe: { window: 0, document: 0, element: 0, pointerdown: 0, touchstart: 0,
+      startAccepted: 0, lastReject: null, lastLayer: null },
+    unmuteProbe: { events: 0, attempts: 0, lastReason: null, lastLayer: null, stillMuted: null },
+    // v2.1.6：注入时机 / 遮罩裁剪 / 零点击解除静音探针
+    earlyRegistered: false, bootReadyState: null,
+    dmClip: { enabled: true, area: 0.25, source: '默认 1/4 屏', applied: 0,
+      masks: [], lastAt: null, clipped: 0,
+      // v2.1.7 独占手势层探针
+      layerMounted: false, layerRect: null, tiles: 0, controls: [],
+      state: 'inline', touchSeen: 0, blockedBySite: 0, rateWritable: null,
+      rateTestedAt: null, hudAvoid: null,
+      // v2.1.8 短按透传探针
+      tapForwarded: 0, dblForwarded: 0, tapSwallowed: 0,
+      lastTapTarget: null, lastTapReason: null, lastTapAt: 0 },
+    earlyUnmute: { tried: 0, ok: 0, reverted: 0, lastReason: null, keys: {} },
   };
   const LOG = (tag, msg) => {
     const line = '[' + new Date().toLocaleTimeString('zh-CN', { hour12: false }) + '] ' + tag + ' · ' + msg;
@@ -146,7 +205,32 @@
     return m;
   })();
 
-  const DEFAULTS = {
+  /* ============================================================
+ * v2.2.0 · 触控层总闸：整套停用，把 B 站原生交互完整还回去
+ * ------------------------------------------------------------
+ * v2.1.0 ~ v2.1.8 连续 9 版触控手势，在 iPad Safari / Stay 真机上
+ * 长按无反馈、滑动无反馈，最后连 B 站原生单击显隐工具栏、双击暂停
+ * 都被顶层 tiles 吃掉。之前每一版「50+ 项冒烟全过」都是 Node 里
+ * 用伪造 DOM / MouseEvent / touch 事件跑的模拟测试，不是真机 ——
+ * 拿模拟通过当交付依据，是这轮最根本的错误，不再继续堆第 10 版。
+ *
+ * 这一版不「修手势」，而是把手势整套撤掉：
+ *   · 不注册 window 触控前置桥（保留 gesture 通道给自动解除静音）
+ *   · 不装 document / element 触控层，不给 video 父级加 touch-action
+ *   · 不生成任何顶层 tiles / host，不吞任何 click / dblclick
+ *   · 不合成短按、不裁弹幕层、不写 playbackRate 做触控倍速
+ * => 页面里没有任何脚本层拦截触摸，B 站原生单击 / 双击 / 工具栏 /
+ *    系统全屏 / 官方 H5 手势全部恢复成「没装脚本时」的样子。
+ * 其余增强（搜索、三连、D 开关、自动播放、音量记忆、倍速快捷键、
+ * 全屏铺满、专注屏蔽、下载、截帧、打赏页）一行逻辑都没动。
+ * ============================================================ */
+const TOUCH_OFF = true;   // v2.1.x 旧触控架构保持停用（顶层 tiles / 三层捕获 / 短按合成）
+
+/* v2.3.0 不再复活旧架构，而是新增独立的 TouchV3（见下），按调研结论重写：
+   绑播放器元素、显式 passive:false、第一个 move 就 preventDefault、
+   overscroll-behavior:contain、放行 Element.requestFullscreen、倍速写入读回验证。 */
+
+const DEFAULTS = {
     schema: 13, enabled: true,
     // v1.8：S 键改为「唤出 B 站原生搜索下拉（搜索历史 / 热搜）」，再按一次关闭复原。
     // 关掉则回到 v1.3 的自绘零导航浮层（降级用）。
@@ -160,10 +244,33 @@
     // 学习模式隐藏时保留容器并显示占位文字。holdThresholdMs 为长按判定阈值。
     longPressCancelRate: true, officialHoldToNormal: true,
     hidePlaceholder: true, holdThresholdMs: 340,
+    // v2.1.0 触控倍速：长按进 2× / 按住到时锁定 / 上下滑调档 / 滑动后松手锁定
+    touchRate: true, touchHoldMs: 280, touchLockSec: 10,
+    touchSlidePx: 44, touchSlideLocks: true,
+    // v2.1.2 移动端手势：左右分区亮度 / 音量；F 优先网页全屏避开系统全屏提示
+    touchBrightVolume: true, touchLockRate: 0,
     fillEnabled: true, fillMode: 'auto',
     // v1.6.3：preferredVolume 记住「用户最后一次调整」的数值（含 0%）；
     // rememberVolume 为总开关。volumeTouched 是从未被读取的死字段，已删除。
     autoPlay: true, autoUnmute: true, rememberVolume: true, preferredVolume: 0.8,
+  /* v2.1.6 弹幕遮罩裁剪：按 B 站「弹幕显示区域 / 屏占比」把遮罩裁到只占顶部一块，
+     其余区域 pointer-events:none，让触摸 target 落到 <video> 而不是遮罩层。 */
+  dmClipEnabled: true, dmArea: 0.25,
+  /* v2.1.7：独占顶层手势区（铺满画面显示区域，只对控件挖洞让行）。
+     不再单独设置避让面积：屏占比自动读 B 站播放器弹幕显示区域配置。 */
+  gestureLayer: true,
+  /* v2.1.8：tiles 会接管点击 target，未成手势的短按必须透传回 B 站，
+     否则单击唤不出工具栏、双击暂停不了。关掉则回到 v2.1.7 的纯独占行为。 */
+  tapPassthrough: true,
+  /* v2.3.0 · 移动端同款触控（研究版，独立开关） */
+  touchV3: true, touchV3HoldMs: 280, touchV3LockSec: 10, touchV3SlidePx: 44,
+  touchV3Rates: [0.5, 1, 1.5, 2],
+  /* v2.3.2 · 独占手势 + 新音量档位 */
+  touchBlockNative: true, touchVolume: 0.8,
+  /* v2.3.4 · 绝不能掐 end：B 站手势识别器靠 pointerup/touchend 结束状态机，
+     掐掉它就会永远「以为还在拖」，之后任何 hover / 左右拖 / 单击都被它
+     继续结算成音量与 seek。默认放行。 */
+  touchReleaseEnd: true,
     learnMode: false, barMinimized: false, barAvoidSearch: true,
     // 学习模式默认屏蔽"非学习"分区，保留 知识36 / 科技188 / 资讯202 / 纪录片177
     blockedTids: [1, 3, 4, 5, 11, 23, 119, 129, 155, 160, 181, 211, 217, 223, 234],
@@ -173,7 +280,7 @@
       refresh: 'r', danmu: 'd',
       searchZoom: 's', floatSearch: 'Shift+S', triple: 'b', capture: 'c',
       fullscreen: 'f', fillToggle: 'Shift+F', fillReset: 'Shift+R', mute: 'm',
-      rateDown: '[', rateUp: ']', learn: 'g', nativeFullscreen: ''
+      rateDown: '[', rateUp: ']', learn: 'g'
     },
     confirmTriple: false,
     // 搜索：永远零导航，页内渲染结果；官方提交一律拦截
@@ -255,7 +362,7 @@
   }
   delete CORE.autoPlayDone;
   delete CFG.volumeTouched;
-  CFG.schema = 15;
+  CFG.schema = 30;
   // 无论旧配置存过什么，这版一律清干净，确保 A / Shift+Enter 不被任何残留键位占用
   ['dmQuick', 'dmQuickAlt', 'dmQuick2', 'danmuFocus', 'danmuQuick', 'danmuSend'].forEach(k => delete CFG.shortcuts[k]);
   CFG.shortcuts.floatSearch = CFG.shortcuts.floatSearch || 'Shift+S';
@@ -270,6 +377,109 @@
     delete CFG.blockAppBanner;
     delete CFG.blockAppJump;
     LOG('Migrate', 'v2.0.5：已彻底移除防跳转 / 去 App 横幅全部功能、命令与配置键');
+  }
+  // v2.0.5 → v2.1.0：触控倍速新增 5 个键，旧配置自动补默认；不动其它任何键。
+  if (savedCfg && (!savedCfg.schema || savedCfg.schema < 16)) {
+    ['touchRate', 'touchHoldMs', 'touchLockSec', 'touchSlidePx', 'touchSlideLocks'].forEach(k => {
+      if (CFG[k] === undefined) CFG[k] = DEFAULTS[k];
+    });
+    LOG('Migrate', 'v2.0.5 → v2.1.0：新增触控倍速（长按 2× / 锁定 / 滑动调档）与倍速写入仲裁');
+  }
+  // v2.1.1 → v2.1.2：新增「左右分区亮度/音量」与「F 优先网页全屏」两个键
+  if (savedCfg && (!savedCfg.schema || savedCfg.schema < 17)) {
+    ['touchBrightVolume'].forEach(k => { if (CFG[k] === undefined) CFG[k] = DEFAULTS[k]; });
+    LOG('Migrate', 'v2.1.1 → v2.1.2：移动端手势（左亮度 / 右音量 / 下滑解锁）');
+  }
+  // v2.1.2 → v2.1.3：彻底弃用系统全屏（保留吞 API，但不再自建 DOM 全屏）
+  if (savedCfg && (!savedCfg.schema || savedCfg.schema < 18)) {
+    delete CFG.webFullscreenFirst;
+    LOG('Migrate', 'v2.1.2 → v2.1.3：弃用系统全屏 / 原生视频全屏');
+  }
+  // v2.3.3 → v2.3.4：掐 end 会让 B 站手势状态机卡死（松手后仍调音量 / 左右拖 seek / 单击变进度）。
+  if (savedCfg && (!savedCfg.schema || savedCfg.schema < 29)) {
+    CFG.touchReleaseEnd = true;
+    try { Store.set('cfg', CFG); } catch (e) {}
+    LOG('Migrate', 'v2.3.3 → v2.3.4：松手事件完整放行给 B 站，防止手势状态机卡死');
+  }
+  // v2.3.1 → v2.3.2：滑左侧时 B 站原生音量手势叠触发；长按下滑被它抢成调音量。
+  // 改为手势激活后独占事件（capture + stopImmediatePropagation），并补新音量档位。
+  if (savedCfg && (!savedCfg.schema || savedCfg.schema < 27)) {
+    CFG.touchBlockNative = true;
+    if (typeof CFG.touchVolume !== 'number' || !isFinite(CFG.touchVolume)) CFG.touchVolume = 0.8;
+    try { Store.set('cfg', CFG); } catch (e) {}
+    LOG('Migrate', 'v2.3.1 → v2.3.2：独占原生音量手势 / 下滑锁定语义 / 亮度与音量百分比 HUD');
+  }
+  // v2.3.0 → v2.3.1：真机诊断 events:82 / starts:0 / lastReject:"控件让行"
+  // 定位到旧 inControl() 的 [class*=] 宽通配沿祖先链误杀全部 touchstart。
+  // 同时修被 v2.2.0 写盘污染成 false 的亮度/音量键（那版没有 UI 入口可开回来）。
+  if (savedCfg && (!savedCfg.schema || savedCfg.schema < 26)) {
+    CFG.touchBrightVolume = true;
+    CFG.touchV3 = true;
+    try { Store.set('cfg', CFG); } catch (e) {}
+    LOG('Migrate', 'v2.3.0 → v2.3.1：控件判定改几何 / 亮度手势恢复 / 诊断记录 rejectTarget');
+  }
+  // v2.2.0 → v2.3.0：按 WebKit 功能开关调研重装触控（独立 V3 架构）。
+  // 恢复 v2.2.0 强制关掉的亮度/音量键，旧顶层 tiles 架构仍停用。
+  if (savedCfg && (!savedCfg.schema || savedCfg.schema < 25)) {
+    CFG.touchBrightVolume = true; CFG.touchSlideLocks = true; CFG.touchRate = true;
+    CFG.touchV3 = true; CFG.touchLockRate = 0;
+    CFG.gestureLayer = false; CFG.tapPassthrough = false;   // 旧架构不再启用
+    try { Store.set('cfg', CFG); } catch (e) {}
+    LOG('Migrate', 'v2.2.0 → v2.3.0：按调研重装移动端触控（绑元素 / passive:false / 放行元素全屏）');
+  }
+  // v2.1.8 → v2.2.0：触控手势整套停用，还原 B 站原生单击 / 双击 / 工具栏。
+  // 旧配置里所有触控键一律强制关，防止升级后又被打开；并清掉可能残留的
+  // 手势层 DOM class（真正的 host 元素由 GestureLayer.clear() 在 boot 时移除）。
+  if (savedCfg && (!savedCfg.schema || savedCfg.schema < 24)) {
+    ['gestureLayer', 'tapPassthrough', 'touchRate', 'touchBrightVolume',
+     'touchSlideLocks', 'dmClipEnabled'].forEach(k => { CFG[k] = false; });
+    CFG.touchLockRate = 0;
+    delete CFG.dmArea;
+    try { Store.set('cfg', CFG); } catch (e) {}   // 写回，避免旧配置反复被载入
+    LOG('Migrate', 'v2.1.8 → v2.2.0：触控层整套停用 / B 站原生交互完整恢复');
+    try {
+      document.querySelectorAll('.bpe-touchzone,.bpe-dm-pass,.bpe-dm-clip,.bpe-gl-host')
+        .forEach(el => el.classList.remove('bpe-touchzone', 'bpe-dm-pass', 'bpe-dm-clip', 'bpe-gl-host'));
+    } catch (e) {}
+  }
+  // v2.1.7 → v2.1.8：独占手势层把单击/双击 target 也吃了，B 站工具栏唤不出、
+  // 无法暂停。补「短按透传」：未成手势的短按合成 click / dblclick 到下层 B 站元素。
+  if (savedCfg && (!savedCfg.schema || savedCfg.schema < 23)) {
+    if (CFG.tapPassthrough === undefined) CFG.tapPassthrough = true;
+    LOG('Migrate', 'v2.1.7 → v2.1.8：短按透传（单击显隐工具栏 / 双击暂停交还 B 站）');
+  }
+  // v2.1.6 → v2.1.7：撤回「裁 B 站弹幕层」，改为自建独占顶层手势区。
+  // 避让面积不再单独设置：自动读取 B 站播放器弹幕显示区域配置，读不到才用内置回退。
+  if (savedCfg && (!savedCfg.schema || savedCfg.schema < 22)) {
+    // 旧开关值继承为新开关，避免升级后功能凭空消失
+    if (CFG.gestureLayer === undefined) CFG.gestureLayer = (savedCfg.dmClipEnabled !== false);
+    delete CFG.dmArea;                  // 不再由用户单独设置屏占比
+    LOG('Migrate', 'v2.1.6 → v2.1.7：独占顶层手势区 / 屏占比联动 B 站设置 / 倍速可写性诊断');
+    // 清掉旧版残留在 B 站 DOM 上的 class，避免两套方案并存
+    try {
+      document.querySelectorAll('.bpe-dm-pass,.bpe-dm-clip').forEach(el =>
+        el.classList.remove('bpe-dm-pass', 'bpe-dm-clip'));
+    } catch (e) {}
+  }
+  // v2.1.5 → v2.1.6：前置注入 + 弹幕遮罩裁剪 + 零点击解除静音（补默认配置）
+  if (savedCfg && (!savedCfg.schema || savedCfg.schema < 21)) {
+    if (CFG.dmClipEnabled === undefined) CFG.dmClipEnabled = true;
+    if (!CFG.dmArea) CFG.dmArea = 0.25;
+    LOG('Migrate', 'v2.1.5 → v2.1.6：document-start 前置注册 / 弹幕遮罩裁剪 / 零点击解除静音');
+  }
+  // v2.1.4 → v2.1.5：触控事件层修复（仅新增探针字段，不改用户配置）
+  if (savedCfg && (!savedCfg.schema || savedCfg.schema < 20)) {
+    LOG('Migrate', 'v2.1.4 → v2.1.5：触控监听提升 window 层 / 修 shadow DOM 误杀 / unmute 手势层');
+  }
+  // v2.1.3 → v2.1.4：撤回 .bpe-webfull 布局强改，清理可能残留的 class
+  if (savedCfg && (!savedCfg.schema || savedCfg.schema < 19)) {
+    try {
+      document.querySelectorAll('.bpe-webfull,.bpe-webfull-on').forEach(el => {
+        el.classList.remove('bpe-webfull');
+      });
+      document.documentElement.classList.remove('bpe-webfull-on');
+    } catch (e) {}
+    LOG('Migrate', 'v2.1.3 → v2.1.4：撤回播放器容器布局强改，清理残留 class');
   }
   CORE.barPos = Store.get('barPos', null);
   // 旧版可能把专注条停在顶部搜索框附近，v1.3 一律复位到左下
@@ -519,6 +729,49 @@
     .bpe-blk:hover { opacity:1; background:#fb7299; }
     /* 仅清除 v1.0/v1.1 残留，防止旧版留在 DOM 上的类继续制造黑屏 */
     html.bpe-fill::before { display:none!important; }
+    /* 视觉亮度用样式表 !important + CSS 变量，不会被 Fill 重写 inline style 冲掉 */
+    html.bpe-bright video {
+      filter:brightness(var(--bpe-bright,1))!important;
+      -webkit-filter:brightness(var(--bpe-bright,1))!important; }
+    /* v2.1.4 修复：v2.1.3 把播放器容器 fixed 到 100vw/100vh 并用 !important
+       强改内部 video / video-area / row 的尺寸，破坏了 B 站自己的 flex 与
+       absolute 定位上下文 → 画面消失、弹幕散到顶部、控制栏溢出屏幕。
+       这版彻底撤回：全屏交给 B 站自己的「网页全屏」按钮（纯 CSS 状态），
+       脚本一个布局属性都不碰，只在 video 上做 object-fit 铺满（v1.2 已验证不黑屏）。
+       .bpe-touchzone 只关 iPad 长按系统菜单 + 让 video 不把触摸交给滚动，
+       不改任何定位 / 尺寸 / 层级，控制栏与弹幕层完全不受影响。 */
+    .bpe-touchzone { -webkit-touch-callout:none!important; -webkit-user-select:none!important;
+      user-select:none!important; -webkit-tap-highlight-color:transparent!important; }
+    .bpe-touchzone video { touch-action:none!important; }
+    /* v2.1.6 · 弹幕遮罩裁剪（用户方案）：只改 pointer-events 与 clip-path，
+       绝不改定位 / 尺寸 / 层级 —— v2.1.4 的教训：动布局会把弹幕与控制栏全撑坏。
+       .bpe-dm-pass 让弹幕渲染层不再抢 touch target（弹幕文字照常显示）；
+       .bpe-dm-clip 再按「弹幕屏占比」把蒙版 / 遮罩裁到只保留顶部一块，
+       clip-path 裁掉的区域同时不再参与 hit-testing，双保险放行手势。 */
+    .bpe-dm-pass { pointer-events:none!important; }
+    .bpe-dm-clip {
+      clip-path: inset(0 0 calc(100% - var(--bpe-dm-keep, 25%)) 0)!important;
+      -webkit-clip-path: inset(0 0 calc(100% - var(--bpe-dm-keep, 25%)) 0)!important;
+      pointer-events:none!important; }
+    /* v2.1.7 · 独占顶层手势区（按你的方案，替换「裁 B 站弹幕层」）
+       host 挂 document.body，position:fixed 跟 video 的视口矩形，透明、不吃弹幕显示；
+       host 本身 pointer-events:none，只有 tiles 收事件 —— 控件矩形处没有 tile，
+       hit-test 自然落到 B 站控制栏 / 弹幕输入框 / 进度条，真正做到「只让控件」。
+       不碰 B 站任何 DOM 属性（v2.1.4 教训），也不和弹幕层争 z-index。 */
+    .bpe-gl-host { position:fixed; pointer-events:none; z-index:2147483640;
+      background:transparent; border:0; margin:0; padding:0; }
+    .bpe-gl-tile { position:absolute; pointer-events:auto; background:transparent;
+      touch-action:none!important; -webkit-touch-callout:none!important;
+      -webkit-user-select:none!important; user-select:none!important;
+      -webkit-tap-highlight-color:transparent!important; }
+    /* v2.3.0 · 只加在【播放器元素】上的行为类，一个布局属性都不碰
+       （v2.1.4 教训：动 position/尺寸/层级会把画面、弹幕、控制栏全撑坏）。
+       对应你截图里已开的 CSS Overscroll Behavior / Scroll Anchoring /
+       Unprefixed User Select 三个 WebKit 开关。 */
+    .bpe-tv3 { touch-action:none!important; overscroll-behavior:contain!important;
+      overflow-anchor:none!important; -webkit-touch-callout:none!important;
+      -webkit-user-select:none!important; user-select:none!important;
+      -webkit-tap-highlight-color:transparent!important; }
   `;
 
   /* ============================================================
@@ -650,6 +903,56 @@
       background:rgba(24,25,32,.92); color:#fff; font-size:12.5px; line-height:1.5; text-align:center;
       box-shadow:0 14px 40px rgba(0,0,0,.3); transition:.24s; }
     .bpe-toast.show { opacity:1; transform:translateX(-50%) translateY(0); }
+    /* v2.1.2 · B 站移动版风格 HUD：贴画面上方边缘的小胶囊，不遮挡中央人脸。
+       左半屏手势贴左、右半屏贴右；半透明、不模糊背景、1.6s 自动淡出。 */
+    .bpe-touch-hud { position:fixed; top:max(11%, min(calc(var(--bpe-dm-keep, 25%) + 12px), 78%));
+      z-index:2147483622; min-width:172px; max-width:250px;
+      padding:9px 13px 10px; border-radius:13px; pointer-events:none;
+      opacity:0; color:#fff; background:rgba(20,21,27,.80);
+      border:1px solid rgba(255,255,255,.14); box-shadow:0 10px 28px rgba(0,0,0,.28);
+      transition:opacity .16s, transform .16s; }
+    .bpe-touch-hud.left { left:14px; transform:translateY(-8px); }
+    .bpe-touch-hud.right { right:14px; transform:translateY(-8px); }
+    .bpe-touch-hud.center { left:50%; margin-left:-96px; transform:translateY(-8px); }
+    .bpe-touch-hud.on { opacity:1; transform:translateY(0); }
+    .bpe-touch-hud.center.on { transform:translateY(0); }
+    .bpe-th-main { font-size:14px; font-weight:800; letter-spacing:.3px; line-height:1.3; }
+    .bpe-th-sub { font-size:10px; opacity:.80; margin-top:3px; line-height:1.45; }
+    .bpe-th-bar { height:4px; margin-top:8px; border-radius:99px;
+      background:rgba(255,255,255,.18); overflow:hidden; }
+    .bpe-th-bar > i { display:block; height:100%; width:0%; border-radius:99px;
+      background:linear-gradient(90deg,#00aeec,#fb7299); transition:width .12s linear; }
+    /* ============================================================
+       v2.3.5 · 极简手势 HUD（按你要求重做）
+       · 左/右各一条【竖】进度条：emoji + XX% + 细轨（宽 7px），无底框、无副标题
+       · 倍速只用一行低可见度文字，无进度条、无「上滑/下滑」长说明
+       · opacity .5 左右，松手立刻消失（display 直接关，不等淡出定时器）
+       · 非全屏：竖条放 video 矩形外侧，倍速放画面上方外侧
+       · 全屏：竖条贴屏幕左右边缘，倍速放画面顶端
+       ============================================================ */
+    .bpe-tv-level { position:fixed; z-index:2147483622; pointer-events:none;
+      display:none; flex-direction:column; align-items:center; gap:5px;
+      opacity:.52; transition:opacity .1s; }
+    .bpe-tv-level.on { display:flex; }
+    .bpe-tv-emo { font-size:13px; line-height:1; text-shadow:0 1px 3px rgba(0,0,0,.65); }
+    .bpe-tv-track { width:7px; height:118px; border-radius:99px;
+      background:rgba(255,255,255,.14); overflow:hidden;
+      display:flex; align-items:flex-end; box-shadow:0 1px 6px rgba(0,0,0,.22); }
+    .bpe-tv-track > i { display:block; width:100%; height:0%; border-radius:99px;
+      background:rgba(255,255,255,.78); transition:height .07s linear; }
+    .bpe-tv-pct { font-size:10px; color:#fff; letter-spacing:.2px;
+      font-variant-numeric:tabular-nums; text-shadow:0 1px 3px rgba(0,0,0,.7); }
+    .bpe-tv-rate { position:fixed; z-index:2147483622; pointer-events:none;
+      display:none; opacity:.5; color:#fff; font-size:15px; font-weight:700;
+      letter-spacing:.4px; padding:4px 9px; border-radius:8px; white-space:nowrap;
+      background:rgba(20,21,27,.40); text-shadow:0 1px 4px rgba(0,0,0,.7); } 
+    .bpe-tv-rate.on { display:block; }
+    /* 锁定徽标：右侧偏下，避开搜索框与专注条；可点按解除 */
+    .bpe-rate-lock { position:fixed; right:14px; top:38%; z-index:2147483623;
+      pointer-events:auto; padding:8px 13px; border-radius:999px; cursor:pointer;
+      font-size:12px; font-weight:700; color:#fff; border:1px solid rgba(255,255,255,.22);
+      background:linear-gradient(135deg,#fb7299,#a06bff); box-shadow:0 8px 26px rgba(0,0,0,.32); }
+    .bpe-rate-lock:active { transform:scale(.96); }
     /* 默认左下角，彻底避开顶部 B 站搜索框；可拖动，位置持久化 */
     .bpe-filterbar { position:fixed; left:14px; bottom:calc(14px + env(safe-area-inset-bottom));
       pointer-events:auto; display:flex; align-items:center; gap:8px; padding:7px 9px 7px 7px; border-radius:14px;
@@ -782,19 +1085,103 @@
    * 8. 播放器接管：倍速仲裁 / 音量恢复 / 元素查找
    * ============================================================ */
   let curVideo = null, unmuteTries = 0;
+  /* ============================================================
+   * v2.1.0 · 倍速写入仲裁（解决「升降档会卡一下」）
+   * ------------------------------------------------------------
+   * 查证到的三个成因：
+   * ① commaai/connect#595：每次写 video.playbackRate 都会打到音频解码器，
+   *    连续快速写（1.5→1→2）会触发解码器重初始化 → iOS Safari 上爆音 / 卡顿 /
+   *    速率复位。旧版 stepRate 每次按键都「findVideo 全量遍历 DOM + 同步 save()
+   *    序列化 + toast 重绘 + 立即写 playbackRate」，正是那一下顿挫。
+   * ② CSDN《网页视频倍速控制原理》：网站若在 ratechange 回调里把倍速重置，
+   *    ratechange 是异步的，会出现「变快又弹回、像被拍了一下」。
+   * ③ hls.js 讨论区：Safari 的 rate change 有 100–500ms 非确定性延迟；
+   *    旧版 endOfficialHold 还刻意 0/60/180ms 连写三次，等于连拍三下。
+   *
+   * 统一做法：所有写入进 Rate.set → requestAnimationFrame 合并，同一帧只写
+   * 最后一次；写入后记录 intent，ratechange 里只在偏离时「下一帧校正一次」；
+   * CFG.rate 的 save() 防抖 160ms；toast 按「档位+来源」140ms 节流；
+   * stepRate 用缓存的 curVideo，不再全量 deepFind。
+   * v1.7 铁律不变：officialHold.active 期间脚本绝不写 playbackRate。
+   * ============================================================ */
+  const raf = window.requestAnimationFrame ? window.requestAnimationFrame.bind(window)
+    : (f => setTimeout(f, 16));
   const Rate = {
-    applying: false,
-    apply(v, r, remember, quiet) {
-      if (!v) return;
+    applying: false, intent: null, pending: null, frame: 0, watchdog: null,
+    saveTimer: null, toastKey: '', toastAt: 0,
+    set(v, r, opts) {
+      if (!v) return false;
+      const o = opts || {};
       const rate = Math.min(16, Math.max(0.0625, Number(r) || 1));
-      if (Math.abs(v.playbackRate - rate) < 0.001) return false;
-      this.applying = true;
-      try { v.playbackRate = rate; } catch (e) {}
-      setTimeout(() => { this.applying = false; }, 80);
-      if (remember) { CFG.rate = rate; save(); }
-      if (!quiet) toast('倍速 ' + rate + '×');
-      LOG('Rate', '写入 ' + rate + '×' + (quiet ? '（静默）' : ''));
+      this.pending = { v: v, rate: rate, remember: !!o.remember,
+        quiet: !!o.quiet, tag: o.tag || '' };
+      if (this.frame && this.watchdog) return true;
+      this.frame = raf(() => {
+        this.frame = 0;
+        if (this.watchdog) { clearTimeout(this.watchdog); this.watchdog = null; }
+        this.flush();
+      });
+      /* v2.1.2：iPad Safari 全屏播放时 requestAnimationFrame 会被节流甚至暂停。
+         排一个 90ms 定时器兜底，flush() 本身幂等（pending 被消费即返回），
+         双保险下仍只写一次 playbackRate，不会重新引入「连拍解码器」。 */
+      if (!this.watchdog) this.watchdog = setTimeout(() => {
+        this.watchdog = null; this.frame = 0; this.flush();
+      }, 90);
       return true;
+    },
+    flush() {
+      const p = this.pending; this.pending = null;
+      if (!p || !p.v) return;
+      if (CORE.officialHold && CORE.officialHold.active) return;   // v1.7
+      if (Math.abs(p.v.playbackRate - p.rate) < 0.001) {
+        if (p.remember) this.remember(p.rate);
+        return;
+      }
+      this.intent = p.rate;
+      this.applying = true;
+      try { p.v.playbackRate = p.rate; } catch (e) {}
+      raf(() => { this.applying = false; });
+      if (p.remember) this.remember(p.rate);
+      if (!p.quiet) this.toastRate(p.rate, p.tag);
+      LOG('Rate', '写入 ' + p.rate + '×' + (p.quiet ? '（静默）' : '') + (p.tag ? ' · ' + p.tag : ''));
+    },
+    remember(rate) {
+      CFG.rate = rate;
+      if (this.saveTimer) clearTimeout(this.saveTimer);
+      this.saveTimer = setTimeout(() => { this.saveTimer = null; save(); }, 160);
+    },
+    toastRate(rate, tag) {
+      const key = rate + '|' + (tag || ''), now = Date.now();
+      if (key === this.toastKey && now - this.toastAt < 140) return;
+      this.toastKey = key; this.toastAt = now;
+      toast((tag ? tag + ' · ' : '') + '倍速 ' + rate + '×');
+    },
+    // 兼容旧调用点；返回「是否真的需要改」（写入是异步的，不能读回判断）
+    apply(v, r, remember, quiet) {
+      if (!v) return false;
+      const changed = Math.abs(v.playbackRate - (Number(r) || 1)) >= 0.001;
+      this.set(v, r, { remember: remember, quiet: quiet });
+      return changed;
+    },
+    // ratechange 校正：只排一次下一帧，绝不连写
+    correct(v) {
+      if (!v || this.intent === null || this.applying) return;
+      if (CORE.officialHold && CORE.officialHold.active) return;
+      /* v2.1.2 关键修复：旧版在这里写了 `if (touchRate.active) return`，
+         把「触控期间被 B 站/其它脚本在 ratechange 回调里改回 1×」也一起放过，
+         于是长按写 2× 后立刻被覆盖，实机表现就是「长按没用」。
+         现在触控期间照常校正 —— intent 就是脚本刚写的目标，不是旧记忆档位；
+         连续 move 会不断刷新 intent，校正永远指向最新目标，不会两路抢写。
+         （restoreRate 里的触控让位保留，那里读的是 CFG.rate 旧档位。） */
+      if (Math.abs(v.playbackRate - this.intent) <= 0.001) return;
+      const target = this.intent;
+      setTimeout(() => {
+        if (this.intent !== target || Math.abs(v.playbackRate - target) < 0.001) return;
+        this.applying = true;
+        try { v.playbackRate = target; } catch (e) {}
+        setTimeout(() => { this.applying = false; }, 0);
+        LOG('Rate', 'ratechange 校正一次 → ' + target + '×');
+      }, 0);
     }
   };
   function findVideo() {
@@ -901,10 +1288,17 @@
       return true;
     } finally { setTimeout(() => { CORE.applyingVolume = false; }, 0); }
   }
+  let restoreQueued = false;
+  function scheduleRestore(v) {
+    // v2.1.0：loadedmetadata / canplay / playing 等 6 个事件会连发，
+    // 合并成同一帧只调一次，避免 B 站初始化时反复碰 playbackRate。
+    if (restoreQueued) return;
+    restoreQueued = true;
+    raf(() => { restoreQueued = false; restoreRate(v); });
+  }
   function restoreRate(v) {
-    // v1.7：官方「长按右方向键 3×」期间脚本绝不写 playbackRate，
-    // 否则会把官方的临时 3× 覆盖成脚本记忆的旧档位。
-    if (CORE.officialHold && CORE.officialHold.active) return;
+    if (CORE.officialHold && CORE.officialHold.active) return;   // v1.7 铁律
+    if (CORE.touchRate && CORE.touchRate.active) return;         // v2.1.0 手势期间让位
     if (CFG.rateEnabled && CFG.rememberRate && Math.abs((CFG.rate || 1) - 1) > 0.001) Rate.apply(v, CFG.rate, false);
   }
   /* v1.7：统一的「回到 1× 原速」入口。关键是同时清掉 CFG.rate 记忆，
@@ -917,8 +1311,12 @@
     const changed = Rate.apply(v, 1, true, true);
     CORE.rateDiag = {
       at: new Date().toLocaleTimeString('zh-CN', { hour12: false }), reason: why,
-      before: before, after: v.playbackRate, changed: changed, rememberedRate: 1
+      before: before, after: 1, changed: changed, rememberedRate: 1
     };
+    CORE.touchRate = { active: false, session: 'idle', rate: 1 };
+    CFG.touchLockRate = 0; CORE.touchLock = { rate: 0 };
+    CORE.touchDiag = null;
+    if (typeof Touch !== 'undefined') { Touch.hideLock(); Touch.hideHud(); }
     LOG('Rate', '回到 1× 原速（' + why + '）· 之前 ' + before + '×');
     return true;
   }
@@ -941,26 +1339,22 @@
      最后一次统一提示，避免闪回 2× 或 toast 刷屏。 */
   function endOfficialHold() {
     const seen = CORE.officialHold && CORE.officialHold.official3xSeen;
-    // 结束会清掉 officialHold，把结论落到 rateDiag 方便事后诊断
     CORE.rateDiag = Object.assign({}, CORE.rateDiag || {}, {
       at: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
       reason: '官方长按右方向键 3× 松开', official3xSeen: !!seen, rememberedRate: 1
     });
     CORE.officialHold = null;
-    let announced = false, saved = false;
-    const fix = (final) => {
-      if (!saved) { CFG.rate = 1; save(); saved = true; }   // 三次校正只写一次配置
-      const v = findVideo();
-      if (v && Math.abs(v.playbackRate - 1) > 0.001) Rate.apply(v, 1, true, true);
-      if (final && !announced) {
-        announced = true;
-        toast(seen ? '↩︎ 松开右方向键 · 已回到 1× 原速' : '↩︎ 松开右方向键 · 已回到 1×（未检测到官方 3×）');
-        LOG('Rate', '官方长按 3× 结束 → 回到 1× 原速（不恢复之前档位）· 检测到官方 3×=' + !!seen);
-      }
-    };
-    fix(false);
-    setTimeout(() => fix(false), 60);
-    setTimeout(() => fix(true), 180);
+    // v2.1.0：旧版 0 / 60 / 180ms 连写三次，在 iOS Safari 上等于连拍三下解码器。
+    // 现在只写一次（Rate.set 会合并），再排一帧复核一次；配置只 save 一次。
+    CFG.rate = 1; save();
+    const v = curVideo || findVideo();
+    if (v) Rate.apply(v, 1, false, true);
+    raf(() => {
+      const v2 = curVideo || findVideo();
+      if (v2 && Math.abs(v2.playbackRate - 1) > 0.001) Rate.apply(v2, 1, false, true);
+    });
+    toast(seen ? '↩︎ 松开右方向键 · 已回到 1× 原速' : '↩︎ 松开右方向键 · 已回到 1×（未检测到官方 3×）');
+    LOG('Rate', '官方长按 3× 结束 → 回到 1× 原速（不恢复之前档位）· 检测到官方 3×=' + !!seen);
   }
   const AP_WINDOW = 20000, AP_TICK = 320;
   let apTimer = null;
@@ -987,6 +1381,53 @@
     try { btn.click(); apNote('已点 B 站官方播放按钮兜底', {}); return true; }
     catch (e) { apNote('点官方播放按钮失败：' + e.message, {}); return false; }
   }
+  /* v2.1.6 · 一进播放页就带声音，不用再点一下画面
+   * ------------------------------------------------------------
+   * 你这句问得对：「一进播放页都能自动播放了，咋还不能解除禁音」——
+   * 因为旧版在 tryPlayOnce() 里先怂了：audible = userHasGesture() && ...，
+   * 刚进页面时 navigator.userActivation.hasBeenActive 常为 false，脚本就
+   * 主动设了 muted=true 静音起播，之后只能等下一次真实手势才 unmute。
+   * 但 play() 能成功，说明 Safari 已经放行了这次播放；既然如此就该
+   * 直接试带声音起播，别自己预判。
+   *
+   * 两层：① 起播前不再预判手势，直接 unmuted 试 play()（被拒才回退静音）；
+   *      ② 若仍是静音起播（回退路径），在 play() 成功的同一个 then() 里
+   *         再同步 unmute 一次，并加 160ms 看门狗：Apple 文档说「无手势
+   *         取消静音会暂停播放」，万一 Safari 真暂停了，立即恢复静音续播，
+   *         画面不中断、首次真实手势仍会出声。全程尊重用户主动暂停。
+   * ============================================================ */
+  function tryEarlyUnmute(v, key) {
+    const E = CORE.earlyUnmute;
+    if (!CFG.enabled || !CFG.autoUnmute || CORE.userMuted || !v || !v.muted) return false;
+    if (E.keys[key]) return false;
+    E.keys[key] = 1; E.tried++;
+    CORE.apUnmuteProbing = key;
+    const ok = unmuteNow(v, '起播同步 · 零点击尝试');
+    if (!ok) {
+      CORE.apUnmuteProbing = null;
+      E.lastReason = 'unmuteNow 未执行（已非静音 / 自动解除关闭）';
+      return false;
+    }
+    setTimeout(() => {
+      if (CORE.apUnmuteProbing !== key) return;
+      CORE.apUnmuteProbing = null;
+      if (CORE.apPaused[key]) { E.lastReason = '此间你主动暂停了，脚本让位不抢播'; return; }
+      if (v.paused) {
+        E.reverted++;
+        CORE.applyingVolume = true;
+        try { v.muted = true; } catch (e) {}
+        setTimeout(() => { CORE.applyingVolume = false; }, 0);
+        const p = v.play(); if (p && p.catch) p.catch(() => {});
+        E.lastReason = 'Safari 在无手势上下文暂停了播放 → 已回退静音续播；首次真实手势仍会出声';
+        apNote('零点击解除静音被 Safari 回退（平台限制，画面不中断）', { key: key });
+      } else {
+        E.ok++;
+        E.lastReason = '✅ 零点击已带声音起播（无需点画面）';
+        apNote('零点击解除静音成功 · 进播放页即有声音', { key: key });
+      }
+    }, 160);
+    return true;
+  }
   function tryPlayOnce(v, key) {
     if (!apAllowed(v, key)) return;   // 唯一硬门槛：所有调用都会过这一关
     CORE.apTries++;
@@ -994,7 +1435,9 @@
        用户点开视频本身就是手势，Safari 允许 → 画面和声音同时开始。
        Apple 明确要求 unmute 与 play() 在同一手势上下文里同步完成，
        所以这里在 play() 之前设好 muted / volume，绝不在 play().then() 里 unmute。 */
-    const audible = userHasGesture() && CFG.autoUnmute && !CORE.userMuted;
+    // v2.1.6：不再用 userHasGesture() 预判。点开视频本身就是导航手势，
+    // play() 能成功就说明 Safari 放行了 —— 直接试带声音，被拒再回退静音。
+    const audible = CFG.autoUnmute && !CORE.userMuted;
     CORE.applyingVolume = true;
     try {
       v.autoplay = true; v.playsInline = true;
@@ -1025,6 +1468,8 @@
         apNote(audible ? '✅ 已带声音起播（零延迟）· 此后暂停完全归你'
                        : '✅ 已静音起播 · 首次手势同步恢复声音',
           { readyState: v.readyState, muted: v.muted, volume: CFG.preferredVolume });
+        // v2.1.6：静音起播成功后，在 play() 已 resolve 的上下文里再试一次零点击 unmute
+        if (v.muted) tryEarlyUnmute(v, key);
         // 注意：这里不再 setTimeout(restoreVolume, 60)。Apple：在 play().then() 里
         // 取消静音会被判定「无手势」，Safari 会暂停播放 —— 那正是旧版迟钝的根因。
       }).catch(err => {
@@ -1085,9 +1530,13 @@
   }
   function autoPlayVideo(v) { scheduleAutoPlay(v); }
   function attachVideo(v) {
+    // v2.1.5 元素层：触摸落在 <video> / 其父级时，即使 window、document 两层
+    // 都被 B 站的 stopImmediatePropagation 拦掉，at-target 这一层仍可能收到。
+    try { installTouchLayer(v, 'element'); installTouchLayer(v.parentElement || v, 'element'); }
+    catch (e) { LOG('Touch', '元素层绑定跳过：' + e.message); }
     const onMeta = () => {
       autoPlayVideo(v);
-      restoreRate(v);
+      scheduleRestore(v);
       // v1.6.3：换视频时应用记忆音量（只在 volume 可写的环境；iPad 上跳过，
       // 不覆盖系统音量、不制造假同步）。脚本写入由 applyingVolume 屏蔽，不会污染记忆。
       applyPreferredVolume(v);
@@ -1099,15 +1548,24 @@
       const k = apKey(v);
       CORE.apPlayed[k] = 1;
       stopAutoPlay();
-      restoreRate(v);
+      scheduleRestore(v);
       applyPreferredVolume(v);
-      // 不再在这里 unmute：Apple 要求 unmute 必须在用户手势回调内同步完成
+      // v2.1.6：非本脚本 play() 路径起播（B 站自己触发）时，也补一次零点击 unmute
+      if (v.muted && CFG.autoPlay) tryEarlyUnmute(v, k);
+      // Apple：unmute 必须在手势回调内同步完成；这里是 play() 已成功的续接，
+      // 配 160ms 看门狗，被 Safari 回退就静音续播，绝不让画面黑掉。
     }, { passive: true });
     // v1.6.2：pause = 用户意志，任何时刻都立刻终结自动起播。
     // 初始 paused=true 不会产生 pause 事件，所以「加载慢时用户先按了暂停」
     // 也会被尊重；不判断 apPlayed，避免脚本随后又补播覆盖掉这次暂停。
     v.addEventListener('pause', () => {
       const k = apKey(v);
+      // v2.1.6：零点击 unmute 试探可能被 Safari 暂停，这是脚本自己造成的，
+      // 不能记成「用户主动暂停」而永久收手；交给 tryEarlyUnmute 的看门狗处理。
+      if (CORE.apUnmuteProbing === k) {
+        apNote('零点击 unmute 试探让 Safari 暂停了 · 交给看门狗回退', { key: k });
+        return;
+      }
       CORE.apPaused[k] = 1;
       stopAutoPlay();
       apNote('检测到暂停 · 自动起播已永久收手（不再补播）', { key: k, played: !!CORE.apPlayed[k] });
@@ -1139,7 +1597,10 @@
       if (CORE.officialHold && CORE.officialHold.active && Math.abs(v.playbackRate - 3) < 0.75) {
         CORE.officialHold.official3xSeen = true;
       }
-      if (!Rate.applying) LOG('Rate', '播放器/其他脚本把倍速改为 ' + v.playbackRate + '（本套件不抢写）');
+      if (!Rate.applying) {
+        LOG('Rate', '播放器/其他脚本把倍速改为 ' + v.playbackRate + '×');
+        Rate.correct(v);          // v2.1.0：只排一次下一帧校正，不连写
+      }
     }, { passive: true });
     onMeta();
   }
@@ -1173,29 +1634,1235 @@
       } catch (e) {}
     });
   }
+  /* ============================================================
+   * v2.1.6 · 弹幕遮罩裁剪（按你的思路做）
+   * ------------------------------------------------------------
+   * 你判断「是不是被弹幕遮罩挡住了」很可能是对的：B 站的弹幕层 /
+   * 蒙版层是一块铺满画面、pointer-events:auto 的覆盖物，它自己还挂着
+   * 亮度 / 音量手势监听 —— 手指的 touch target 落在遮罩上，事件先被
+   * B 站消费（所以「左右上下滑动都是音量」），网页脚本拿不到。
+   *
+   * 做法严格守住 v2.1.4 的教训：不改定位 / 尺寸 / 层级，只改两件事：
+   *  ① 给弹幕渲染层加 .bpe-dm-pass → pointer-events:none，
+   *     target 落到 <video>，遮罩上的 B 站手势监听自然收不到；
+   *  ② 给蒙版 / 遮罩层加 .bpe-dm-clip → 按「弹幕屏占比」用
+   *     clip-path 只保留顶部那一块，裁掉的区域同时不再参与 hit-testing。
+   * 弹幕文字照常显示，控制栏 / 弹幕输入框一个不碰。
+   * ============================================================ */
+  /* ============================================================
+   * v2.1.7 · 独占顶层手势区（按你的方案，替换 v2.1.6 的「裁 B 站弹幕层」）
+   * ------------------------------------------------------------
+   * 调研结论：裁弹幕层走不通 —— clip-path 只裁可见区、不改 hit-test；
+   * 而且「整屏都是音量」说明 B 站自己的手势识别器先消费了纵向位移。
+   * 开源先例（BiliTouch / 触摸屏视频优化 / HTML5 视频手势）做法一致：
+   * 不猜站点内部层，而是自己建一个稳定的手势根，给它 touch-action:none，
+   * 自建 HUD 设 pointer-events:none，并在手势激活后主动掐断冒泡。
+   *
+   * 这版按你确认的口径落地：
+   *  ① host 挂 document.body，position:fixed 精确跟随 <video> 的视口矩形
+   *     （「刚好覆盖显示区域」；B 站网页全屏时 video 铺满 = 整屏）
+   *  ② host 本身 pointer-events:none，只有 tiles 收事件；tiles 由
+   *     「画面矩形 减去 控件矩形」的扫描线分解生成 —— 控制栏 / 弹幕输入框 /
+   *     进度条上方没有 tile，hit-test 自然落到 B 站控件（「只让控件」）
+   *  ③ 弹幕显示区照常收手势（透明层不影响弹幕文字显示，也不碰 B 站 DOM）
+   *  ④ 避让面积不单独设置：自动读 B 站播放器「弹幕显示区域」配置，
+   *     写进 --bpe-dm-keep，只用来把 HUD 放到弹幕区下方；读不到用内置回退
+   *  ⑤ 手势激活后 preventDefault + stopPropagation（绝不 stopImmediatePropagation，
+   *     v2.0.5 教训 + BilibiliHotkeyManager 明确警告会误伤其它扩展）
+   *  ⑥ 事件转发给既有 Touch 状态机，三层前置桥 / document / 元素层保留作兜底，
+   *     单例 session 去重，不重写长按 / 锁定 / 亮度 / 音量任何逻辑
+   * ============================================================ */
+  const GestureLayer = {
+    host: null, sig: '', tiles: [], holes: [],
+    tap: null, lastTapAt: 0, lastTapX: 0, lastTapY: 0,
+
+    /* 自动联动 B 站弹幕显示区域 —— 不再有脚本自己的屏占比设置项。
+       ① 播放器配置 JSON（localStorage）② 设置面板 DOM 文案 ③ 内置回退 1/4。
+       结果同时写 --bpe-dm-keep 供 HUD 避让，并在诊断里标 source，不编造。 */
+    area() {
+      const C = CORE.dmClip;
+      let val = null, source = '';
+      try {
+        const keys = ['bpx_player_profile', 'bilibili_player_settings',
+          'bpx-player-setting', 'player_setting', 'bpx_player_settings'];
+        for (const k of keys) {
+          let raw = null;
+          try { raw = localStorage.getItem(k); } catch (e) {}
+          if (!raw) continue;
+          let j = null; try { j = typeof raw === 'string' ? JSON.parse(raw) : raw; } catch (e) { continue; }
+          if (!j || typeof j !== 'object') continue;
+          const cand = j.dmArea ?? j.danmakuArea ?? j.dm_area ?? j.dmScreen ??
+            (j.dm && (j.dm.area ?? j.dm.dmArea ?? j.dm.screen)) ??
+            (j.danmaku && (j.danmaku.area ?? j.danmaku.screen));
+          if (cand !== undefined && cand !== null) {
+            const n = Number(cand);
+            if (isFinite(n) && n > 0) {
+              val = n > 4 ? n / 100 : (n >= 1 && n <= 4 ? [0.25, 0.5, 0.75, 1][Math.round(n) - 1] : n);
+              source = 'B 站播放器配置 ' + k;
+              break;
+            }
+          }
+        }
+      } catch (e) {}
+      if (val === null) {
+        try {
+          const el = document.querySelector('[data-dm-area],[data-danmaku-area],.bpx-player-dm-area,[class*="dm-area"],[class*="danmaku-area"]');
+          if (el) {
+            const raw = el.getAttribute('data-dm-area') || el.getAttribute('data-danmaku-area') ||
+              el.getAttribute('data-value') || '';
+            const txt = (el.textContent || '') + ' ' + raw;
+            if (/1\/4|四分之一|25%/.test(txt)) val = 0.25;
+            else if (/半屏|1\/2|50%/.test(txt)) val = 0.5;
+            else if (/3\/4|75%/.test(txt)) val = 0.75;
+            else if (/全屏|不限|100%/.test(txt)) val = 1;
+            if (val !== null) source = 'B 站弹幕设置面板';
+          }
+        } catch (e) {}
+      }
+      if (val === null) { val = 0.25; source = '内置回退 1/4 屏（未读到 B 站配置）'; }
+      val = Math.min(1, Math.max(0.15, val));
+      C.area = val; C.source = source;
+      C.hudAvoid = Math.round(val * 100) + '%';
+      // 只在值变化时写：避免 attribute mutation 反复触发 MutationObserver 自激
+      try {
+        const ds = document.documentElement.style;
+        if (ds.getPropertyValue('--bpe-dm-keep') !== C.hudAvoid)
+          ds.setProperty('--bpe-dm-keep', C.hudAvoid);
+      } catch (e) {}
+      return val;
+    },
+
+    state() {
+      if (document.fullscreenElement || document.webkitFullscreenElement) return 'system';
+      let ds = '';
+      try {
+        const c = document.querySelector('.bpx-player-container,[class*="player-container"]');
+        ds = (c && c.getAttribute('data-screen')) || '';
+      } catch (e) {}
+      if (ds === 'web' || (typeof WebFull !== 'undefined' && WebFull.isOn())) return 'web';
+      if (ds === 'full') return 'full';
+      return 'inline';
+    },
+
+    /* 收集需要让行的 B 站控件矩形。只认「横条 / 输入框 / 进度条」这类，
+       绝不把整个播放器容器当控件（否则 tiles 会被挖空）。 */
+    controlRects(R) {
+      const sels = ['.bpx-player-control-bottom', '.bpx-player-control-entity',
+        '.bpx-player-ctrl-bottom', '.bpx-player-progress', '.bpx-player-progress-wrap',
+        '.bpx-player-video-inputbar', '.bpx-player-dm-input', '.bpx-player-dm-sendbar',
+        '.bili-player-video-inputbar', '.bili-player-video-progress',
+        '[class*="sendbar"]', '[class*="inputbar"]', '[class*="progress-wrap"]',
+        '[class*="player-control-bottom"]', '[class*="danmaku-input"]'];
+      const out = [], seen = new Set();
+      const pad = 4;
+      try {
+        collectRoots().forEach(root => {
+          sels.forEach(sel => {
+            let list = [];
+            try { list = Array.prototype.slice.call(root.querySelectorAll(sel)); } catch (e) {}
+            list.forEach(el => {
+              if (!el || seen.has(el)) return;
+              seen.add(el);
+              let e = null; try { e = el.getBoundingClientRect(); } catch (x) { return; }
+              if (!e.width || !e.height) return;
+              const l = Math.max(R.l, e.left - pad), t = Math.max(R.t, e.top - pad);
+              const r = Math.min(R.r, e.right + pad), b = Math.min(R.b, e.bottom + pad);
+              if (r - l < 12 || b - t < 8) return;
+              // 排除「几乎就是整块画面」的容器，避免误挖空
+              if ((r - l) > R.w * 0.97 && (b - t) > R.h * 0.9) return;
+              out.push({ l: l, t: t, r: r, b: b, cls: String(el.className || '').slice(0, 60) });
+            });
+          });
+        });
+      } catch (e) {}
+      // 控制栏常是 hover 才显形；读不到时按 B 站已知布局留底部安全条
+      const hasBottom = out.some(h => h.b >= R.b - 8 && (h.r - h.l) > R.w * 0.5);
+      if (!hasBottom) {
+        const guard = Math.min(64, Math.round(R.h * 0.14));
+        out.push({ l: R.l, t: R.b - guard, r: R.r, b: R.b, cls: '底部控件安全条（内置回退）' });
+      }
+      return out;
+    },
+
+    /* 扫描线分解：画面矩形减去控件矩形 → 一组互不重叠、不含控件的 tile。
+       这是「铺满画面但只让控件」最稳的实现：控件区域没有 tile，
+       hit-test 自然落到 B 站控件，不需要改 B 站任何 CSS，也不依赖 clip-path。 */
+    subtract(R, holes) {
+      const cl = (x, a, b) => Math.max(a, Math.min(b, x));
+      const hs = holes.map(h => ({ l: cl(h.l, R.l, R.r), t: cl(h.t, R.t, R.b),
+        r: cl(h.r, R.l, R.r), b: cl(h.b, R.t, R.b) }))
+        .filter(h => h.r - h.l > 1 && h.b - h.t > 1);
+      const ys = new Set([R.t, R.b]);
+      hs.forEach(h => { ys.add(h.t); ys.add(h.b); });
+      const Y = Array.from(ys).sort((x, y) => x - y), out = [];
+      for (let i = 0; i < Y.length - 1; i++) {
+        const y0 = Y[i], y1 = Y[i + 1];
+        if (y1 - y0 < 1) continue;
+        const act = hs.filter(h => h.t <= y0 + 0.5 && h.b >= y1 - 0.5);
+        const xs = new Set([R.l, R.r]);
+        act.forEach(h => { xs.add(h.l); xs.add(h.r); });
+        const X = Array.from(xs).sort((x, y) => x - y);
+        for (let j = 0; j < X.length - 1; j++) {
+          const x0 = X[j], x1 = X[j + 1];
+          if (x1 - x0 < 1) continue;
+          const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
+          if (act.some(h => cx > h.l && cx < h.r && cy > h.t && cy < h.b)) continue;
+          out.push({ l: x0, t: y0, w: x1 - x0, h: y1 - y0 });
+        }
+      }
+      return out;
+    },
+
+    /* 所有事件路径（window 前置桥 / document / 元素层 / 手势层）共用的让行判定：
+       落在控件洞内就不启动手势，B 站控制栏 / 输入框 / 进度条完全归 B 站。 */
+    isHole(x, y) {
+      const n = Number(x), m = Number(y);
+      if (!isFinite(n) || !isFinite(m)) return false;
+      return (this.holes || []).some(h => n >= h.l && n <= h.r && m >= h.t && m <= h.b);
+    },
+    contains(node) {
+      let n = node;
+      while (n) { if (n === this.host) return true; n = n.parentNode || n.parentElement; }
+      return false;
+    },
+
+    install() {
+      if (TOUCH_OFF) return null;   // v2.2.0：绝不生成顶层 host / tiles
+      if (this.host && this.host.isConnected) return this.host;
+      const h = document.createElement('div');
+      h.className = 'bpe-gl-host';
+      h.setAttribute('data-bpe', 'gesture-layer');
+      const self = this;
+      ['pointerdown', 'pointermove', 'pointerup', 'pointercancel',
+       'touchstart', 'touchmove', 'touchend', 'touchcancel'].forEach(t => {
+        h.addEventListener(t, e => self.on(t, e),
+          { capture: true, passive: t !== 'touchmove' });
+      });
+      /* v2.1.8：tile 是 pointer-events:auto 的独立顶层元素，浏览器会给它
+         派发兼容 click / dblclick。这些事件只沿 host→body 冒泡，B 站收不到；
+         但若 B 站在 document 上有委托，就会和「我们合成的那一发」双触发。
+         所以把 tile 自己产生的兼容鼠标点击吞掉，统一由 forwardTap() 发一发。 */
+      ['click', 'dblclick'].forEach(t => {
+        h.addEventListener(t, e => {
+          if (!CFG.tapPassthrough) return;
+          CORE.dmClip.tapSwallowed++;
+          try { e.stopPropagation(); e.preventDefault(); } catch (_) {}
+        }, { capture: true, passive: false });
+      });
+      (document.body || document.documentElement).appendChild(h);
+      this.host = h;
+      return h;
+    },
+
+    /* v2.1.8 · 穿透 tiles 取「B 站自己的那一层」。
+       elementsFromPoint 给出整条命中链，跳过手势层自身节点即可；
+       老 WebKit 没有它时，临时把 tiles 的 pointer-events 关掉再取，取完还原。
+       绝不改 B 站 DOM，也不动任何布局属性。 */
+    under(x, y) {
+      try {
+        if (document.elementsFromPoint) {
+          const list = document.elementsFromPoint(x, y) || [];
+          const el = list.find(n => n && !this.contains(n) && n !== document.body &&
+            n !== document.documentElement && n !== document);
+          if (el) return el;
+        }
+      } catch (e) {}
+      try {
+        const nodes = (this.host && this.host.children) ? Array.prototype.slice.call(this.host.children) : [];
+        const saved = nodes.map(n => n.style && n.style.pointerEvents);
+        nodes.forEach(n => { if (n.style) n.style.pointerEvents = 'none'; });
+        if (this.host) this.host.style.pointerEvents = 'none';
+        let el = null;
+        try { el = document.elementFromPoint(x, y); } catch (e) {}
+        nodes.forEach((n, i) => { if (n.style) n.style.pointerEvents = saved[i] || ''; });
+        if (this.host) this.host.style.pointerEvents = '';
+        return (el && !this.contains(el)) ? el : null;
+      } catch (e) { return null; }
+    },
+
+    /* 未成手势的短按 → 合成 click / dblclick 到下层 B 站元素。
+       判定完全独立于 Touch.session：位移 < 12px 且时长 < 长按阈值余量，
+       长按（静止超时）和滑动（位移大）都不会误转发。 */
+    forwardTap(x, y, t0, src) {
+      const C = CORE.dmClip;
+      const now = Date.now(), dt = now - t0;
+      const hold = Math.max(160, (Number(CFG.touchHoldMs) || 280) - 40);
+      if (dt >= hold) { C.lastTapReason = '超过短按窗口（长按/滑动手势）'; return false; }
+      if (CFG.tapPassthrough === false) { C.lastTapReason = '短按透传开关已关'; return false; }
+      // 控件洞内永远不合成点击：那块区域归 B 站控件，任何事件路径都守同一规则
+      if (this.isHole(x, y)) { C.lastTapReason = '落在控件让行区，交还 B 站控件'; return false; }
+      const el = this.under(x, y);
+      if (!el) { C.lastTapReason = '穿透 tiles 后没找到下层元素'; return false; }
+      const init = { bubbles: true, cancelable: true, view: window,
+        clientX: x, clientY: y, button: 0, detail: 1 };
+      try {
+        el.dispatchEvent(new MouseEvent('click', init));
+        C.tapForwarded++;
+        C.lastTapTarget = (el.tagName || 'node') + '.' + String(el.className || '').slice(0, 46);
+        // 双击窗口：320ms 内、两点距离 < 30px
+        if (now - this.lastTapAt < 320 && Math.abs(x - this.lastTapX) < 30 &&
+            Math.abs(y - this.lastTapY) < 30) {
+          el.dispatchEvent(new MouseEvent('dblclick', Object.assign({}, init, { detail: 2 })));
+          C.dblForwarded++;
+          this.lastTapAt = 0;
+          C.lastTapReason = '已透传 单击 + 双击（B 站工具栏 / 暂停）';
+        } else {
+          this.lastTapAt = now; this.lastTapX = x; this.lastTapY = y;
+          C.lastTapReason = '已透传 单击（B 站显隐工具栏）';
+        }
+        LOG('GestureLayer', '短按透传 → ' + C.lastTapTarget + ' · ' + C.lastTapReason + ' · src=' + src);
+        return true;
+      } catch (e) {
+        C.lastTapReason = '合成 click 失败：' + e.message;
+        return false;
+      }
+    },
+
+    /* 手势层的事件入口：转发给既有 Touch 状态机（不重写任何手势逻辑）。
+       手势已激活后掐断冒泡，避免 B 站自己的音量 HUD 同时弹出来。 */
+    on(t, e) {
+      const C = CORE.dmClip;
+      C.touchSeen++;
+      const ev = (e.touches || e.changedTouches) ? touchEv(e, t) : e;
+      const isTouch = t.indexOf('touch') === 0;
+      // pointer 通道只在没有 touch 通道时（鼠标）承担短按透传，避免同一次
+      // 手指触摸既发 touch 又发 pointer 导致 click 双发。
+      const tapSrc = isTouch ? 'touch' : 'pointer';
+      if (t === 'touchstart' || t === 'pointerdown') {
+        this.tap = { x: ev.clientX, y: ev.clientY, t0: Date.now(), src: tapSrc, gestured: false };
+      } else if (t === 'touchmove' || t === 'pointermove') {
+        const s = Touch.session;
+        if (this.tap && (Math.abs(ev.clientY - this.tap.y) > 12 ||
+            Math.abs(ev.clientX - this.tap.x) > 12 ||
+            (s && (s.active || s.mode === 'bright' || s.mode === 'volume')))) {
+          this.tap.gestured = true;
+        }
+      }
+      try {
+        if (t === 'pointerdown') Touch.start(ev);
+        else if (t === 'pointermove') Touch.move(ev);
+        else if (t === 'pointerup') Touch.end(ev, false);
+        else if (t === 'pointercancel') {
+          const s = Touch.session;
+          if (!(s && s.touchSeen)) Touch.end(ev, true);
+        }
+        else if (t === 'touchstart') {
+          const s = Touch.session;
+          if (s) { s.touchSeen = true; s.source = 'touch'; s.startY = ev.clientY; s.startX = ev.clientX; }
+          else Touch.start(ev);
+        }
+        else if (t === 'touchmove') Touch.move(ev);
+        else if (t === 'touchend') Touch.end(ev, false);
+        else Touch.end(ev, true);
+      } catch (err) { LOG('GestureLayer', '转发跳过：' + err.message); }
+      // 只在手势真的激活后才拦，短按 / 控件点击完全放行
+      if (t === 'touchmove' || t === 'pointermove') {
+        const s = Touch.session;
+        if (s && (s.active || s.mode === 'bright' || s.mode === 'volume')) {
+          try { e.preventDefault(); } catch (_) {}
+          try { e.stopPropagation(); C.blockedBySite++; } catch (_) {}
+        }
+      }
+      /* v2.1.8：短按结算 —— 只有「未成手势」的那一次才透传给 B 站。
+         ① 同时收到 touch + pointer 时，只让 touch 通道发（鼠标走 pointer）
+         ② 长按/滑动已把 this.tap.gestured 置 true，不转发
+         ③ 控件洞里本来没有 tile，不会走到这里 */
+      if (t === 'touchend' || t === 'pointerup') {
+        const tp = this.tap;
+        this.tap = null;
+        if (tp && !tp.gestured && CFG.tapPassthrough) {
+          // 只吞「紧跟同一次 touchend 的那个 pointerup」，绝不跨独立短按：
+          // v2.1.8 初版用 120ms 全局窗口，会把 150ms 内的快速双击也吞掉。
+          if (t === 'touchend') {
+            CORE.lastTouchEndAt = Date.now();
+            this.forwardTap(tp.x, tp.y, tp.t0, tp.src);
+          } else if (Date.now() - (CORE.lastTouchEndAt || 0) >= 90) {
+            // 纯鼠标 / 只有 pointer 的场景，独立转发一次
+            this.forwardTap(tp.x, tp.y, tp.t0, tp.src);
+          }
+        }
+      } else if (t === 'touchcancel' || t === 'pointercancel') {
+        this.tap = null;
+      }
+    },
+
+    mount(R, holes, tiles) {
+      const h = this.install();
+      h.style.left = Math.round(R.l) + 'px';
+      h.style.top = Math.round(R.t) + 'px';
+      h.style.width = Math.round(R.w) + 'px';
+      h.style.height = Math.round(R.h) + 'px';
+      // 只在几何签名变化时重建，避免 MutationObserver 自激循环
+      const sig = JSON.stringify({ r: [Math.round(R.l), Math.round(R.t), Math.round(R.w), Math.round(R.h)],
+        h: holes.map(x => [Math.round(x.l), Math.round(x.t), Math.round(x.r), Math.round(x.b)]) });
+      if (sig === this.sig && this.tiles.length) return false;
+      this.sig = sig;
+      try { h.textContent = ''; } catch (e) { h.innerHTML = ''; }
+      tiles.forEach(t => {
+        const d = document.createElement('div');
+        d.className = 'bpe-gl-tile';
+        d.style.left = Math.round(t.l - R.l) + 'px';
+        d.style.top = Math.round(t.t - R.t) + 'px';
+        d.style.width = Math.max(1, Math.round(t.w)) + 'px';
+        d.style.height = Math.max(1, Math.round(t.h)) + 'px';
+        h.appendChild(d);
+      });
+      this.tiles = tiles;
+      return true;
+    },
+
+    clear() {
+      try { if (this.host) this.host.remove(); } catch (e) {}
+      this.host = null; this.tiles = []; this.sig = ''; this.holes = []; this.tap = null;
+      // 迁移清理：旧版留在 B 站 DOM 上的裁剪 class 一并抹掉
+      try {
+        document.querySelectorAll('.bpe-dm-pass,.bpe-dm-clip').forEach(el =>
+          el.classList.remove('bpe-dm-pass', 'bpe-dm-clip'));
+      } catch (e) {}
+    },
+
+    /* Apple 官方：iOS 上 playbackRate 可能不可写。写一次 2× 再读回，
+       立刻还原、不存档、不提示 —— 诊断里如实给出 true/false/null。 */
+    rateTest() {
+      const C = CORE.dmClip;
+      const v = curVideo || findVideo();
+      if (!v) { C.rateWritable = null; return null; }
+      const before = v.playbackRate;
+      let ok = false;
+      try {
+        v.playbackRate = 2;
+        ok = Math.abs(v.playbackRate - 2) < 0.001;
+        v.playbackRate = before;
+      } catch (e) { ok = false; }
+      C.rateWritable = ok;
+      C.rateTestedAt = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+      return ok;
+    },
+
+    apply(why) {
+      const C = CORE.dmClip;
+      if (TOUCH_OFF) {
+        this.clear(); C.layerMounted = false; C.tiles = 0; C.controls = [];
+        this.holes = []; this.tap = null;
+        return false;
+      }
+      if (!CFG.enabled || !CFG.gestureLayer) {
+        this.clear(); C.layerMounted = false; C.tiles = 0; C.controls = []; this.holes = [];
+        return false;
+      }
+      let R = null;
+      try {
+        const v = curVideo || findVideo();
+        const r = v && v.getBoundingClientRect();
+        if (r && r.width > 80 && r.height > 60) R = { l: r.left, t: r.top, r: r.right, b: r.bottom,
+          w: r.width, h: r.height };
+      } catch (e) {}
+      if (!R) { C.layerMounted = false; C.tiles = 0; this.holes = []; return false; }
+      const area = this.area();
+      C.state = this.state();
+      const holes = this.controlRects(R);
+      this.holes = holes;
+      const tiles = this.subtract(R, holes);
+      const rebuilt = this.mount(R, holes, tiles);
+      C.layerMounted = true;
+      C.layerRect = { l: Math.round(R.l), t: Math.round(R.t), w: Math.round(R.w), h: Math.round(R.h) };
+      C.tiles = tiles.length;
+      C.applied = tiles.length;
+      C.controls = holes.map(h => ({ cls: h.cls, w: Math.round(h.r - h.l), h: Math.round(h.b - h.t) }));
+      C.masks = [];
+      C.clipped = 0;
+      C.lastAt = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+      if (C.rateWritable === null) this.rateTest();
+      if (why === 'manual' || rebuilt) {
+        LOG('GestureLayer', '独占顶层手势区 · ' + C.state + ' · ' + tiles.length + ' 块 tile · 让行 ' +
+          holes.length + ' 处控件 · 弹幕区 ' + Math.round(area * 100) + '%（' + C.source + '）· 倍速可写=' + C.rateWritable);
+      }
+      return true;
+    }
+  };
+  Bus.register('gestureDiag', () => {
+    GestureLayer.apply('manual');
+    GestureLayer.rateTest();
+    const C = CORE.dmClip;
+    const d0 = Object.assign({}, C); delete d0.appliedEls;
+    const d = Object.assign({}, d0, {
+      checkedAt: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
+      enabled: !!CFG.gestureLayer, page: location.pathname,
+      early: window.__BPE_EARLY__ ? Object.assign({}, window.__BPE_EARLY__) : null,
+      earlyRegistered: !!CORE.earlyRegistered, bootReadyState: CORE.bootReadyState,
+      cssVar: (() => { try { return getComputedStyle(document.documentElement).getPropertyValue('--bpe-dm-keep').trim(); } catch (e) { return null; } })(),
+      probe: Object.assign({}, CORE.touchProbe),
+      videoRect: (() => { try { const v = curVideo || findVideo(); const r = v && v.getBoundingClientRect();
+        return r ? { w: Math.round(r.width), h: Math.round(r.height), t: Math.round(r.top), l: Math.round(r.left) } : null; } catch (e) { return null; } })(),
+      note: 'rateWritable=false 表示 iPadOS 忽略了 playbackRate 写入（Apple 官方平台限制），此时事件层做多少都不会有长按倍速；state=system 表示系统全屏，网页 DOM 收不到触摸。',
+      tapPassthrough: !!CFG.tapPassthrough, tapDiag: {
+        forwarded: C.tapForwarded, dblForwarded: C.dblForwarded,
+        swallowedNativeClick: C.tapSwallowed, lastTarget: C.lastTapTarget,
+        lastReason: C.lastTapReason }
+    });
+    copyText(JSON.stringify(d, null, 2));
+    toast('已复制手势层诊断 · 看 tiles / controls / rateWritable / state');
+  });
+  // 兼容旧版按钮 / 菜单名，避免升级后点不到
+  Bus.register('dmClipDiag', () => Bus.exec('gestureDiag'));
+
+  /* ============================================================
+   * v2.1.4 · 撤回自建 DOM 全屏，回到「在 B 站全屏基础上改造」
+   * ------------------------------------------------------------
+   * v2.1.3 的错：给播放器容器加 .bpe-webfull（position:fixed + 100vw/100vh
+   * + 一串 !important），把 B 站内部 flex 布局与 absolute 定位上下文整个
+   * 撑坏 —— 实机「画面直接没了」「弹幕散在顶部」「画面超出屏幕」。
+   *
+   * 这版一个布局属性都不碰：
+   *  ① F = 点 B 站自己的「网页全屏」按钮（B 站自己处理内部布局，画面必在）
+   *  ② 系统全屏入口仍全部吞掉 / 精确改道，永远不进 Fullscreen API
+   *  ③ 铺满只用 v1.2 那套 <video> inline object-fit（不改容器，已验证不黑屏）
+   *  ④ 触控热区改用 <video>.getBoundingClientRect() 几何判定，
+   *     与 B 站类名 / 容器结构 / 全屏状态彻底解耦
+   * ============================================================ */
+  /* ============================================================
+   * v2.3.0 · 移动端同款触控（研究版，独立于 v2.1.x 旧架构）
+   * ------------------------------------------------------------
+   * 依据《iPadSafari_WebKit功能开关与触控可行性调研.md》：
+   *  ① WebKit 官方（Safari 14.1）：注册在 window/document/body 根上的
+   *     touch / wheel 监听默认 passive，preventDefault() 被忽略，且必须在
+   *     「序列的第一个 move 事件」就调 —— 前 9 版把监听一路提到 window，
+   *     越提越收不到，纵向滑动被判页面滚动 → pointercancel → 手势全断。
+   *     ⇒ 只绑【播放器元素】，显式 {passive:false}，第一个 move 就拦。
+   *  ② CSS Overscroll Behavior / Scroll Anchoring / Unprefixed User Select
+   *     （你截图里三项都已开）⇒ overscroll-behavior:contain、
+   *     overflow-anchor:none、user-select:none + -webkit-touch-callout:none。
+   *  ③ iPadOS 16.4+ 支持 Element.requestFullscreen（Bugzilla 328773），
+   *     DOM 保留、触摸可达 ⇒ 不再吞它，只吞 webkitEnterFullscreen。
+   *  ④ playbackRate 的 iOS 口径冲突（Apple 官方写「不可设置」，社区又有
+   *     「仅 0.5/1/1.5/2 离散值」实测）⇒ 每次写入后【读回验证】，不生效
+   *     就如实提示并尝试 B 站自己的倍速菜单，绝不假装成功。
+   *  ⑤ 不建顶层 tiles、不合成 click、短按完全不 preventDefault
+   *     ⇒ B 站原生单击显隐工具栏 / 双击播放暂停完整保留（v2.2.0 成果）。
+   * ============================================================ */
+  const TouchV3 = {
+    root: null, session: null, _hudT: 0,
+    probe: { events: 0, starts: 0, startsRejected: 0, moves: 0, ends: 0, prevented: 0,
+      passiveWorks: null, rateWritable: null, acceptedRates: null,
+      presentationMode: null, lastReject: null, rejectTarget: null,
+      rejectCount: 0, endsByType: {}, nativeBlocked: 0, volumeWritable: null,
+      brightPct: null, volumePct: null, lastHud: null,
+      endVia: null, noButtonMoves: 0, dupSkipped: 0, leakedCleaned: 0,
+      endReleased: 0, endBlocked: 0, hudKind: null, rateText: null,
+      rateIdx0: null, lockDist: null, stepDist: null, levelVisible: false,
+      globalGuard: false, rootSel: null, lastAt: null },
+    clamp(x, a, b, d) { const n = Number(x); return isFinite(n) ? Math.max(a, Math.min(b, n)) : d; },
+    cfg() {
+      let rates = CFG.touchV3Rates;
+      if (!Array.isArray(rates) || !rates.length) rates = [0.5, 1, 1.5, 2];
+      return {
+        on: CFG.enabled !== false && CFG.touchV3 !== false,
+        holdMs: this.clamp(CFG.touchV3HoldMs, 120, 1200, 280),
+        lockSec: this.clamp(CFG.touchV3LockSec, 3, 60, 10),
+        px: this.clamp(CFG.touchV3SlidePx, 16, 160, 44),
+        rates: rates.map(Number).filter(isFinite),
+        bright: CFG.touchBrightVolume !== false,
+        blockNative: CFG.touchBlockNative !== false,
+        releaseEnd: CFG.touchReleaseEnd !== false
+      };
+    },
+    findRoot() {
+      const v = curVideo || findVideo();
+      if (!v) return null;
+      let r = null;
+      try { r = v.closest('.bpx-player-video-area,[class*="video-area"],[class*="player-video"]'); } catch (e) {}
+      if (!r) r = v.parentElement;
+      // 绝不退化到 document / body —— 根上 passive 默认，前 9 版就栽在这
+      if (!r || !r.addEventListener || r === document || r === document.body ||
+          r === document.documentElement) return null;
+      return r;
+    },
+    /* v2.3.1 · 真机诊断定位到的唯一根因。
+       用户实机回来：events:82、starts:0、moves:0、ends:0、
+       lastReject:"控件让行"、rateWritable:true、presentationMode:"inline"、
+       computed 四项 CSS 全生效 —— 事件全到了，倍速也能写，
+       但每一次 touchstart 都被旧版 inControl() 判成控件直接 return，
+       session 根本没建立，后续 move/end 全部空转。
+       旧写法用 [class*="ctrl-bottom"] / [class*="progress-wrap"] /
+       [class*="sendbar"] / [class*="inputbar"] / [class*="dm-input"]
+       这类宽通配做 el.closest()，会沿 B 站播放器祖先链命中布局容器，
+       于是按在画面正中央也被误杀。
+       现在：① 只认真正可交互元素本身（去掉全部 [class*=] 通配）
+             ② 控件区改用几何：仅排除 video 矩形底部那条控制栏
+             ③ 画面中央一律放行；短按仍不 preventDefault、不合成 click。 */
+    inControl(el, pt) {
+      if (!el) return false;
+      try {
+        if (el.closest && el.closest(
+          'button,a,input,textarea,select,[contenteditable="true"],[role="button"],[data-bpe]'))
+          return true;
+      } catch (e) {}
+      try {
+        const v = this.video();
+        const r = v && v.getBoundingClientRect();
+        if (r && r.height > 0 && pt) {
+          const band = Math.min(76, r.height * 0.16);
+          if (pt.y >= r.bottom - band) return true;   // 底部控制栏 / 进度条 / 弹幕输入条
+        }
+      } catch (e) {}
+      return false;
+    },
+    point(e) {
+      let x = 0, y = 0;
+      if (e.touches && e.touches.length) { x = e.touches[0].clientX; y = e.touches[0].clientY; }
+      else if (e.changedTouches && e.changedTouches.length) { x = e.changedTouches[0].clientX; y = e.changedTouches[0].clientY; }
+      else { x = e.clientX || 0; y = e.clientY || 0; }
+      return { x: x, y: y };
+    },
+    video() { return curVideo || findVideo(); },
+    rateNow() { const v = this.video(); return v ? v.playbackRate : 1; },
+    writeRate(r) {
+      const v = this.video(); if (!v) return false;
+      const before = v.playbackRate;
+      /* ============================================================
+         v2.3.5 · 「一直按着还会回到原速」的真因之一。
+         TouchV3 直接写 v.playbackRate（同步），会触发 ratechange → Rate.correct()。
+         而 Rate.intent 是上一次【键盘倍速】留下的旧档位（常为 1×）。
+         correct() 见 playbackRate(2×) ≠ intent(1×)，就在 setTimeout 里把
+         倍速改回 1× —— 长按期间按着不动也会被拉回原速。
+         v2.1.2 还特意删了 correct() 里 `if (touchRate.active) return`，
+         于是更没东西挡它。
+         修：写之前把 intent 同步成触控目标、清掉可能残留的 pending，
+         correct() 就会因 |playbackRate - intent| < 0.001 直接 return。
+         同时给 CORE.touchRate 打 active 标记，让 restoreRate（playing /
+         loadedmetadata 等 6 个事件）在触控期间让位，这是第二道保险。
+         ============================================================ */
+      try {
+        Rate.pending = null;
+        Rate.intent = r;
+        CORE.touchRate = { active: true, session: 'touchV3', rate: r };
+      } catch (_) {}
+      try { v.playbackRate = r; } catch (e) { this.probe.rateWritable = false; return false; }
+      const ok = Math.abs(v.playbackRate - r) < 0.01;
+      if (this.probe.rateWritable === null || ok) this.probe.rateWritable = ok;
+      if (!ok && Math.abs(before - v.playbackRate) > 0.01) { try { v.playbackRate = before; } catch (_) {} }
+      if (!ok) {
+        // 资料冲突时的兜底：走 B 站自己的倍速菜单（站点在用户手势链内有权限）
+        const sel = '.bpx-player-ctrl-playbackrate-menu-item[data-value="' + r + '"],' +
+          'li[data-value="' + r + '"][class*="playbackrate"],[data-value="' + r + '"][class*="playbackrate"]';
+        const el = firstMatch([sel]);
+        if (el) { try { el.click(); return true; } catch (_) {} }
+      }
+      return ok;
+    },
+    probeRates() {
+      const v = this.video(); if (!v) return null;
+      const before = v.playbackRate, out = [];
+      this.cfg().rates.forEach(r => {
+        try { v.playbackRate = r; if (Math.abs(v.playbackRate - r) < 0.01) out.push(r); } catch (e) {}
+      });
+      try { v.playbackRate = before; } catch (_) {}
+      this.probe.acceptedRates = out; this.probe.rateWritable = out.length > 0;
+      return out;
+    },
+    hud(main, sub, pct, side) {
+      try { this.probe.lastHud = { main: main, sub: sub, pct: pct, side: side }; } catch (_) {}
+      const h = sr ? sr.querySelector('.bpe-touch-hud') : null;
+      if (!h) return;
+      try {
+        h.hidden = false;
+        h.classList.remove('left', 'right', 'center'); h.classList.add(side || 'center');
+        /* v2.3.3 · 「还是没有任何 UI 提示」的真因。
+           UI_CSS 里 .bpe-touch-hud 基础态是 opacity:0，只有 .on 才 opacity:1；
+           旧架构 showHud() 有 raf(()=>h.classList.add('on'))，
+           v2.3.x 重写 TouchV3.hud() 时漏了这一句 —— h.hidden=false 了，
+           但元素一直全透明，真机上就是「一点提示都没有」。
+           模拟验收里我把 hidden 当可见读，完全没覆盖 CSS 的 opacity 层，所以次次「PASS」。 */
+        h.classList.add('on');
+        h.style.setProperty('opacity', '1', 'important');
+        h.style.setProperty('display', 'block', 'important');
+        const m = h.querySelector('.bpe-th-main'), u = h.querySelector('.bpe-th-sub');
+        if (m) m.textContent = main; if (u) u.textContent = sub || '';
+        const fill = h.querySelector('.bpe-th-bar i');
+        if (fill) fill.style.width = (pct === undefined ? 0 : Math.max(0, Math.min(100, pct * 100))) + '%';
+      } catch (e) {}
+      clearTimeout(this._hudT);
+      this._hudT = setTimeout(() => {
+        try {
+          h.classList.remove('on'); h.hidden = true;
+          h.style.removeProperty('opacity'); h.style.removeProperty('display');
+        } catch (e) {}
+      }, 1600);
+    },
+    /* v2.3.5 · 位置：非全屏放画面外，全屏放画面顶端 / 左右边缘。
+       用 video 的视口矩形判断，不猜 B 站全屏类名。 */
+    geom() {
+      let r = null;
+      try { const v = this.video(); r = v && v.getBoundingClientRect(); } catch (_) {}
+      const W = window.innerWidth || 1366, Hh = window.innerHeight || 1024;
+      const full = !!(r && r.width >= W * 0.9 && r.height >= Hh * 0.82);
+      return { r: r, W: W, Hh: Hh, full: full,
+        vh: (r && r.height > 80 ? r.height : Hh) };
+    },
+    place() {
+      if (!sr) return;
+      const g = this.geom(), q = s => sr.querySelector(s);
+      const B = q('.bpe-tv-bright'), V = q('.bpe-tv-vol'), T = q('.bpe-tv-rate');
+      try {
+        if (g.full) {
+          const ty = Math.round(g.Hh * 0.20);
+          if (B) B.style.cssText = 'left:12px;right:auto;top:' + ty + 'px;';
+          if (V) V.style.cssText = 'right:12px;left:auto;top:' + ty + 'px;';
+          if (T) T.style.cssText = 'top:max(14px, env(safe-area-inset-top));left:50%;transform:translateX(-50%);';
+        } else {
+          const r = g.r;
+          const lx = r ? Math.max(6, Math.round(r.left - 44)) : 8;
+          const rx = r ? Math.min(g.W - 30, Math.round(r.right + 12)) : g.W - 30;
+          const my = r ? Math.round(r.top + r.height / 2 - 70) : Math.round(g.Hh / 2 - 70);
+          if (B) B.style.cssText = 'left:' + lx + 'px;right:auto;top:' + my + 'px;';
+          if (V) V.style.cssText = 'left:' + rx + 'px;right:auto;top:' + my + 'px;';
+          const cx = r ? Math.round(r.left + r.width / 2) : Math.round(g.W / 2);
+          const ty = r ? Math.max(4, Math.round(r.top - 32)) : 8;
+          if (T) T.style.cssText = 'top:' + ty + 'px;left:' + cx + 'px;transform:translateX(-50%);';
+        }
+      } catch (_) {}
+    },
+    /* 竖条：emoji + XX% + 细轨，无副标题、无横进度条 */
+    showLevel(kind, pct, val) {
+      try { this.probe.lastHud = { main: (kind === 'bright' ? '☀ ' : '🔊 ') + Math.round(val * 100) + '%', pct: pct, side: kind };
+        this.probe.hudKind = 'level:' + kind; this.probe.levelVisible = true; } catch (_) {}
+      if (!sr) return;
+      const h = sr.querySelector(kind === 'bright' ? '.bpe-tv-bright' : '.bpe-tv-vol');
+      if (!h) return;
+      this.place();
+      try {
+        const f = h.querySelector('.bpe-tv-track i'), t = h.querySelector('.bpe-tv-pct');
+        if (f) f.style.height = Math.max(0, Math.min(100, pct * 100)) + '%';
+        if (t) t.textContent = Math.round(val * 100) + '%';
+        h.classList.add('on');
+      } catch (_) {}
+    },
+    /* 倍速轻提示：只有一行字，无进度条，低可见度 */
+    showRate(text) {
+      try { this.probe.lastHud = { main: text, side: 'center' };
+        this.probe.hudKind = 'rate'; this.probe.rateText = text; } catch (_) {}
+      if (!sr) return;
+      const h = sr.querySelector('.bpe-tv-rate'); if (!h) return;
+      this.place();
+      try { h.textContent = text; h.classList.add('on'); } catch (_) {}
+    },
+    /* 松手 / 松鼠标立刻消失：直接关 display，不等任何淡出定时器 */
+    hideGesture() {
+      this.probe.levelVisible = false;
+      if (!sr) return;
+      try {
+        ['.bpe-tv-bright', '.bpe-tv-vol', '.bpe-tv-rate'].forEach(q => {
+          const h = sr.querySelector(q); if (h) h.classList.remove('on');
+        });
+      } catch (_) {}
+    },
+    bright(delta) {
+      const v = this.video(); if (!v) return;
+      const cur = this.clamp(CORE.bright.value, 0.4, 1.8, 1);
+      const val = this.clamp(cur + delta, 0.4, 1.8, 1);
+      CORE.bright.value = val;
+      try {
+        document.documentElement.classList.add('bpe-bright');
+        document.documentElement.style.setProperty('--bpe-bright', String(val));
+      } catch (e) {}
+      const pct = Math.round(val * 100);
+      this.probe.brightPct = pct;
+      this.showLevel('bright', (val - 0.4) / 1.4, val);
+    },
+    /* v2.3.2 · 新音量档位：右半屏上下滑，带百分比 HUD。
+       iPad Safari 的 video.volume 多为只读恒 1；能写就写并回读验证，
+       不能写就如实标「网页音量档位」，不冒充系统音量。 */
+    volume(delta) {
+      const cur = this.clamp(Number(CFG.touchVolume), 0, 1, 0.8);
+      const val = this.clamp(cur + delta, 0, 1, 0.8);
+      CFG.touchVolume = val;
+      clearTimeout(this._volSaveT);
+      this._volSaveT = setTimeout(() => { try { save(); } catch (_) {} }, 220);
+      const v = this.video(); let writable = null;
+      if (v) {
+        try { v.volume = val; writable = Math.abs(v.volume - val) < 0.01; }
+        catch (_) { writable = false; }
+      }
+      this.probe.volumeWritable = writable;
+      const pct = Math.round(val * 100);
+      this.probe.volumePct = pct;
+      this.showLevel('vol', val, val);
+    },
+    /* v2.3.2 · 手势激活后独占【move】事件：preventDefault 只挡浏览器默认行为，
+       v2.3.4 起严禁用于 end（见 finish() 长注释）：掐 end 会让 B 站状态机卡死。
+       挡不住 B 站自己注册的 touch 手势识别器（它正是「滑左侧连音量一起调」
+       「长按下滑变调音量」的来源）。捕获阶段 + stopImmediatePropagation
+       才能让它收不到这一批 move/end。短按完全放行，click / dblclick 保留。 */
+    blockNative(e, active, P) {
+      if (!active || this.cfg().blockNative === false) return false;
+      let n = 0;
+      try {
+        if (e.preventDefault) { e.preventDefault(); P.prevented++; n++; }
+        if (P.passiveWorks === null) P.passiveWorks = !!e.defaultPrevented;
+      } catch (_) {}
+      try {
+        if (e.stopImmediatePropagation) e.stopImmediatePropagation();
+        else if (e.stopPropagation) e.stopPropagation();
+        n++;
+      } catch (_) {}
+      if (n) P.nativeBlocked++;
+      return true;
+    },
+    enterHold(s, C) {
+      if (!s || s.mode) return;
+      const v = this.video(); if (!v) return;
+      s.baseRate = this.rateNow();
+      s.mode = 'rate';
+      const locked = Number(CFG.touchLockRate) || 0;
+      s.wasLocked = locked;                 // 记住进入长按前是否已锁定（滑动中会改写 CFG）
+      const target = locked ? 1 : (C.rates.indexOf(2) >= 0 ? 2 : C.rates[C.rates.length - 1]);
+      const ok = this.writeRate(target);
+      s.rate = target;
+      /* v2.3.5 · 「上滑无法升高档位」的真因：
+         旧版拿 C.rates（touchV3Rates，只有 [0.5,1,1.5,2]）算档位，
+         而长按目标已经是 2× = 该表最后一档 → indexOf(2)+steps 永远被
+         clamp 回 2×，上滑一档都升不了。
+         改用全局档位表 CFG.rateList（0.5~5 共 11 档），并固定基准 idx0
+         —— 旧版用「会变的 s.rate」做 indexOf 基准，steps=2 时会连跳两档。 */
+      const list = (Array.isArray(CFG.rateList) && CFG.rateList.length)
+        ? CFG.rateList.map(Number).filter(isFinite) : [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.5, 3, 4, 5];
+      s.rateList = list;
+      s.rateIdx0 = list.indexOf(target);
+      if (s.rateIdx0 < 0) {
+        let best = 0;
+        for (let i = 1; i < list.length; i++)
+          if (Math.abs(list[i] - target) < Math.abs(list[best] - target)) best = i;
+        s.rateIdx0 = best;
+      }
+      this.probe.rateIdx0 = s.rateIdx0;
+      /* v2.3.5 · 长按本身不显示任何 HUD（不要「几倍速 + 上下划」大段提示，
+         也不要进度条）。只在【上滑变档】或【下滑】后才给一行轻提示。 */
+      if (!ok) this.showRate('⚠ 倍速未写入');
+      LOG('TouchV3', '长按 → ' + target + '× · 写入' + (ok ? '成功' : '未生效'));
+    },
+    start(s, C) { /* 占位：逻辑在 on() 内，保留便于诊断 */ },
+    on(t, e) {
+      const C = this.cfg(); if (!C.on) return;
+      const P = this.probe; P.events++; P.lastAt = Date.now();
+      const isStart = t === 'pointerdown' || t === 'touchstart';
+      const isMove = t === 'pointermove' || t === 'touchmove';
+      const isEnd = t === 'pointerup' || t === 'touchend' || t === 'pointercancel' || t === 'touchcancel';
+      const pt = this.point(e);
+      if (isStart) {
+        const v = this.video();
+        if (v && v.webkitPresentationMode === 'fullscreen') {
+          P.presentationMode = 'fullscreen'; P.lastReject = '原生播放器全屏（网页收不到触摸）'; return;
+        }
+        if (this.inControl(e.target, pt)) {
+          P.lastReject = '控件让行'; P.startsRejected++; P.rejectCount++;
+          try {
+            P.rejectTarget = (e.target && e.target.tagName ? e.target.tagName : '?') +
+              '.' + String((e.target && e.target.className) || '').slice(0, 70);
+          } catch (_) { P.rejectTarget = 'unreadable'; }
+          return;
+        }
+        if (this.session) {
+          /* v2.3.3：end 丢失会留下僵尸 session。新按下时先安静清掉
+             （不清定时器会继续触发 enterHold；但不拦这次 pointerdown，
+             否则原生 click 又被吃掉），再正常开新 session。 */
+          P.leakedCleaned++;
+          this.finish('leaked', e, 'start-cleanup', true);
+        }
+        const s = { x: pt.x, y: pt.y, t: Date.now(), mode: null, moved: false,
+          locked: false, stepped: 0, slideDown: null, wasLocked: 0,
+          rateList: null, rateIdx0: 0,
+          src: t.indexOf('touch') === 0 ? 'touch' : 'pointer' };
+        this.session = s; P.starts++; P.lastReject = null;
+        const self = this;
+        s.holdTimer = setTimeout(() => self.enterHold(s, C), C.holdMs);
+        s.lockTimer = setTimeout(() => {
+          if (s.mode === 'rate' && !s.locked) {
+            s.locked = true; CFG.touchLockRate = s.rate; save();
+            self.showRate('🔒 ' + s.rate + '×');
+          }
+        }, C.lockSec * 1000);
+        return;
+      }
+      if (isMove) {
+        const s = this.session; if (!s) return;
+        if (s.lastEvent === e) { P.dupSkipped++; return; }   // 同一事件只结算一次
+        s.lastEvent = e;
+        P.moves++;
+        const dy = s.y - pt.y, dx = pt.x - s.x;
+        if (Math.abs(dy) > 10 || Math.abs(dx) > 10) s.moved = true;
+        // 关键：判定成立后的【第一个】move 就独占（WebKit 要求第一个 move 就拦）。
+        // 短按 / 未达阈值的微小抖动一律放行 → 原生 click / dblclick 完整保留。
+        const active = !!(s.mode || s.moved || Date.now() - s.t >= C.holdMs);
+        /* 未激活 = 短按或微小抖动：连 preventDefault 都不调。
+           滚动已由 .bpe-tv3 的 touch-action:none 挡住（真机诊断 computed 已确认生效），
+           这里再拦反而会抑制浏览器合成 click，伤到单击 / 双击。 */
+        this.blockNative(e, active, P);
+        if (s.mode === 'rate') {
+          if (s.slideDown) return;          // 下滑已锁定/解除，后续回摆不再改档
+          /* v2.3.5 · 阈值按画幅比例，不再用固定 44px。
+             「锁定检测太灵敏，起码 1/5 画面行程」→ lockDist = 画面高 / 5；
+             上滑每档 stepDist = 画面高 / 8（约 73px），也不再一抖就跳档。 */
+          const g = this.geom();
+          const lockDist = Math.max(Math.round(g.vh / 5), C.px * 2);
+          const stepDist = Math.max(Math.round(g.vh / 8), C.px);
+          this.probe.lockDist = lockDist; this.probe.stepDist = stepDist;
+          const dyUp = s.y - pt.y, dyDown = pt.y - s.y;
+          const list = s.rateList || C.rates;
+          if (s.wasLocked) {
+            /* 锁定倍速后长按：下滑 = 解除倍速 */
+            if (dyDown > lockDist) {
+              s.slideDown = 'unlock';
+              CFG.touchLockRate = 0; save();
+              this.writeRate(1);
+              this.showRate('松开还原倍速');
+            }
+          } else {
+            /* 未锁定长按：上滑 = 每跨一档提示「×多少」，下滑 = 锁定倍速 */
+            const steps = Math.max(0, Math.trunc(dyUp / stepDist));
+            if (steps !== s.stepped) {
+              s.stepped = steps;
+              /* 固定基准 idx0，不用会变的 s.rate 做 indexOf（旧版会连跳档） */
+              const idx = Math.max(0, Math.min(list.length - 1, s.rateIdx0 + steps));
+              const r = list[idx];
+              const ok = this.writeRate(r); s.rate = r;
+              this.showRate(r + '×');
+            }
+            if (dyDown > lockDist) {
+              s.slideDown = 'lock';
+              CFG.touchLockRate = s.rate; save();
+              this.showRate('松开锁定倍速');
+            }
+          }
+          return;
+        }
+        if (!s.mode && s.moved && C.bright) {
+          s.mode = pt.x < window.innerWidth / 2 ? 'bright' : 'volume';
+          /* v2.3.1：基线必须取 touchstart 的 y，不是「判定成立那一次 move」的 y。
+             旧写法让第一下滑动的位移被吃掉（s.lastY === pt.y → delta=0），
+             亮度/音量永远停在初始值，看起来像「滑了没反应」。 */
+          s.lastY = s.y;
+        }
+        if (s.mode === 'bright') { this.bright((s.lastY - pt.y) / 260); s.lastY = pt.y; }
+        else if (s.mode === 'volume') { this.volume((s.lastY - pt.y) / 260); s.lastY = pt.y; }
+        return;
+      }
+      if (isEnd) { this.finish(t, e, 'root'); return; }
+    },
+    /* v2.3.3 · 结算逻辑抽出来，root 捕获层和 window 兜底层共用。
+       quiet=true 只用于「新按下时清理僵尸 session」：清定时器 + 清 session，
+       不拦当前事件、不改倍速、不弹 HUD，保证原生 click 完整。 */
+    finish(t, e, via, quiet) {
+      const s = this.session; if (!s) return;
+      const C = this.cfg(), P = this.probe;
+      P.ends++; P.endVia = via || 'root';
+      try { P.endsByType[t] = (P.endsByType[t] || 0) + 1; } catch (_) {}
+      clearTimeout(s.holdTimer); clearTimeout(s.lockTimer);
+      this.session = null;
+      /* v2.3.5 · 松手 / 松鼠标立刻消失，不等 1.6s 淡出；
+         同时撤掉 restoreRate 的让位标记，恢复正常倍速记忆校正。 */
+      this.hideGesture();
+      try { CORE.touchRate = { active: false, session: 'idle', rate: this.rateNow() }; } catch (_) {}
+      // 短按：不 preventDefault、不 stopPropagation、不合成 click
+      // → B 站原生「单击显隐工具栏 / 双击播放暂停」照常。
+      const short = !s.moved && !s.mode && (Date.now() - s.t) < C.holdMs;
+      if (short || quiet) return;
+      /* ============================================================
+         v2.3.4 · 这行旧代码是「没堵上」的真正根因，必须删掉。
+         前几版为了「防 B 站在 touchend 里按起点→终点补算音量」，
+         在 window 捕获层对 pointerup / touchend 调了
+         stopImmediatePropagation()。但 B 站播放器的手势识别器是
+             down(记起点) → move(累计) → up(结算并清零状态机)
+         掐掉 up，它永远收不到「手势结束」，状态机常驻 armed 状态。
+         于是松手后：
+           · 上下 hover move → 被它继续算成音量增量（原生音量条）
+           · 左右 hover move → 被它算成 seek（进度条自己滑）
+           · 再点一下画面   → 积压状态一次性结算（进度变了、音量固定）
+         和用户这轮反馈逐字对得上。
+         「防止补算」是我凭空推测，没有任何证据，代价却远大于收益。
+         现在：end 完整放行（不 preventDefault、不 stop），
+         B 站收到 up 正常结束状态机；我们自己的倍速/锁定结算照做。
+         所有 move 仍由 window 层独占掐掉，B 站一个 move 都收不到，
+         它手里只有 down 起点 + up 终点，判定「未达阈值」正常收工。
+         ============================================================ */
+      if (C.releaseEnd) {
+        P.endReleased++;          // 完全放行，连 preventDefault 都不调
+      } else {
+        /* 回退开关：仅当某个 B 站版本确实在 end 补算时才关 */
+        this.blockNative(e, true, P);
+        P.endBlocked++;
+      }
+      if (s.mode === 'rate') {
+        if (s.slideDown === 'lock') {
+          this.writeRate(s.rate);
+        } else if (s.slideDown === 'unlock') {
+          this.writeRate(1);
+        } else if (s.locked || s.stepped !== 0) {
+          CFG.touchLockRate = s.rate; save(); this.writeRate(s.rate);
+        } else {
+          const back = s.wasLocked || s.baseRate;
+          this.writeRate(back);
+        }
+        // 结算后再隐藏一次（上面的 writeRate 不碰 HUD），保证松手即无 UI
+        this.hideGesture();
+      }
+    },
+    /* 没按下却还在 move = end 丢了（拖出画面外松开 / 切标签 / 系统打断）。
+       这是「松开后上下动鼠标还会调亮度音量」的直接判据。 */
+    notPressed(e) {
+      try {
+        if (e.touches && e.touches.length === 0) return true;
+        if (e.pointerType === 'mouse' && (e.buttons || 0) === 0) return true;
+      } catch (_) {}
+      return false;
+    },
+    /* v2.3.3 · window 捕获层兜底。
+       旧版 end 只绑播放器 root：指针拖出画面外再松开，touchend/pointerup
+       的 target 不在 root 子树 → 事件链根本不经过 root → session 不清、
+       holdTimer/lockTimer 不 clear → 之后任何 hover move 都被当成同一次手势，
+       于是「没点按也能调亮度/音量，得再点一下画面才结束」。
+       而且画面外的 move 由 B 站 document 层监听接走 → 原生音量条又冒出来。
+       window 捕获比 document 捕获更早，在这里接管才能挡住它。 */
+    installGlobalGuard() {
+      if (this._guard) return;
+      this._guard = true; this.probe.globalGuard = true;
+      const self = this;
+      /* 不处理 START：iPad Safari 一次物理按下会同时派发 touchstart + pointerdown，
+         在 window 层清理会被「同一手势的兼容事件」误触发，把刚建立的 session 清掉。
+         僵尸态清理交给 root 的 on() isStart（点击画面时事件必然到达 root）。 */
+      const MOVE = { pointermove: 1, touchmove: 1 };
+      const END = { pointerup: 1, touchend: 1, pointercancel: 1,
+                    touchcancel: 1, mouseup: 1, blur: 1 };
+      ['pointerdown', 'pointermove', 'pointerup', 'pointercancel',
+       'touchstart', 'touchmove', 'touchend', 'touchcancel', 'mouseup', 'blur'].forEach(t =>
+        window.addEventListener(t, e => {
+          const s = self.session; if (!s) return;      // 没有 session = 完全放行
+          /* blur 只安静清 session，绝不拦事件（否则会掐掉页面的切页恢复逻辑） */
+          if (END[t]) { self.finish(t, e, 'guard-end', t === 'blur'); return; }
+          if (MOVE[t]) {
+            if (self.notPressed(e)) {
+              self.probe.noButtonMoves++;
+              /* quiet：只清 session / 定时器，不拦这个 hover move。
+                 掐它同样会让 B 站状态机收不到后续事件而卡住。 */
+              self.finish(t, e, 'guard-nobutton', true);
+              return;
+            }
+            const C = self.cfg();
+            /* v2.3.3 自查修：s.moved 是由 on() 内部设置的，第一个真正滑动的 move
+               到这里时还是 false；若只靠它判 active，window 层会放行第一个 move，
+               B 站 document 捕获层的手势识别器就先收到了 —— 这正是「松开后
+               又冒出原生音量条」的残留路径。这里自己按起点算位移。 */
+            const pt0 = self.point(e);
+            const movedNow = Math.abs(pt0.y - s.y) > 10 || Math.abs(pt0.x - s.x) > 10;
+            const active = !!(s.mode || s.moved || movedNow || Date.now() - s.t >= C.holdMs);
+            if (!active) return;                      // 短按微小抖动：连拦都不拦
+            self.on(t, e);                            // on() 内 blockNative 在 window 层就 stop
+          }
+        }, { capture: true, passive: false }));
+      LOG('TouchV3', 'window 捕获兜底已装 · 拖出画面外松开 / 未按下 hover 都会收手');
+    },
+    install() {
+      if (!this.cfg().on) { this.uninstall(); return false; }
+      const root = this.findRoot();
+      if (!root) return false;
+      if (this.root === root && root.__bpeV3) return false;
+      if (this.root && this.root !== root) { try { this.root.classList.remove('bpe-tv3'); } catch (e) {} }
+      this.root = root;
+      this.probe.rootSel = root.tagName + '.' + String(root.className || '').slice(0, 46);
+      try { root.classList.add('bpe-tv3'); } catch (e) {}
+      if (!root.__bpeV3) {
+        root.__bpeV3 = true;
+        const self = this;
+        ['pointerdown', 'pointermove', 'pointerup', 'pointercancel',
+         'touchstart', 'touchmove', 'touchend', 'touchcancel'].forEach(t =>
+          root.addEventListener(t, e => self.on(t, e), { capture: true, passive: false }));
+        LOG('TouchV3', '已绑定播放器元素（capture/passive:false）· ' + this.probe.rootSel + ' · 手势激活后独占');
+        this.installGlobalGuard();
+      }
+      try {
+        const v = this.video();
+        if (v && !v.__bpeV3Mode) {
+          v.__bpeV3Mode = true;
+          v.addEventListener('webkitpresentationmodechanged', () => {
+            self.probe.presentationMode = v.webkitPresentationMode || null;
+          });
+        }
+      } catch (e) {}
+      return true;
+    },
+    uninstall() {
+      if (this.root) { try { this.root.classList.remove('bpe-tv3'); } catch (e) {} }
+      this.root = null; this.session = null;
+    },
+    diag() {
+      const C = this.cfg();
+      this.probeRates();
+      const v = this.video();
+      let computed = null;
+      try {
+        const cs = getComputedStyle(this.root || document.body);
+        computed = { touchAction: cs.touchAction, overscrollBehavior: cs.overscrollBehavior,
+          overflowAnchor: cs.overflowAnchor, userSelect: cs.userSelect };
+      } catch (e) {}
+      const d = {
+        checkedAt: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
+        version: CORE.version, enabled: C.on, cfg: C,
+        brightEnabled: C.bright, blockNative: C.blockNative,
+        volumePct: Math.round(Number(CFG.touchVolume || 0.8) * 100),
+        touchLockRate: Number(CFG.touchLockRate) || 0,
+        sessionActive: !!this.session,
+        releaseEnd: C.releaseEnd, endReleased: this.probe.endReleased,
+        endBlocked: this.probe.endBlocked,
+        hudKind: this.probe.hudKind, rateText: this.probe.rateText,
+        rateIdx0: this.probe.rateIdx0, lockDist: this.probe.lockDist,
+        stepDist: this.probe.stepDist, levelVisible: this.probe.levelVisible,
+        hudMode: 'v2.3.5 竖条 / 轻提示',
+        hud: (() => {
+          try {
+            const h = sr ? sr.querySelector('.bpe-touch-hud') : null;
+            if (!h) return { found: false };
+            const cs = getComputedStyle(h);
+            return { found: true, hidden: !!h.hidden, on: h.classList.contains('on'),
+              opacity: cs.opacity, display: cs.display, zIndex: cs.zIndex };
+          } catch (err) { return { found: false, err: String(err && err.message || err) }; }
+        })(),
+        root: this.probe.rootSel, bound: !!(this.root && this.root.__bpeV3),
+        computed: computed,
+        probe: Object.assign({}, this.probe),
+        elementFullscreenAPI: !!(document.documentElement.requestFullscreen ||
+          document.documentElement.webkitRequestFullscreen),
+        fsElementFull: !!(document.fullscreenElement || document.webkitFullscreenElement),
+        presentationMode: v ? (v.webkitPresentationMode || null) : null,
+        rateList: CFG.rateList, currentRate: v ? v.playbackRate : null,
+        videoRect: (() => { try { const r = v && v.getBoundingClientRect();
+          return r ? { w: Math.round(r.width), h: Math.round(r.height) } : null; } catch (e) { return null; } })(),
+        hint: 'events>0 但 starts=0 → 控件判定误杀，看 startsRejected / rejectTarget（v2.3.1 已修）；passiveWorks=false 说明 preventDefault 被 WebKit 忽略（监听仍绑在根上）；rateWritable=false 说明 iPadOS 拒绝了 playbackRate 写入（Apple 官方口径）；presentationMode=fullscreen 表示进了原生播放器，网页收不到触摸，请退出后用元素全屏 / 网页全屏。',
+        flagsToCheck: ['设置 → Safari → 高级 → WebKit 功能开关：搜 touch / fullscreen / audio / scroll / select，逐项截图',
+          'CSS Overscroll Behavior = 开、CSS Scroll Anchoring = 开、CSS Unprefixed User Select = 开（你截图里已是）',
+          'Async Audio Session Activation = 开（默认）、AudioSession full API = 关（默认）、Media Session API = 开',
+          '地址栏 AA →「请求桌面网站」做开 / 关两组对照', '改开关后关闭标签页并重新打开页面，flag 才生效']
+      };
+      copyText(JSON.stringify(d, null, 2));
+      toast('已复制触控诊断 · 看 passiveWorks / rateWritable / presentationMode');
+    }
+  };
+  Bus.register('touchV3Diag', () => TouchV3.diag());
+  Bus.register('touchHudTest', () => {
+    TouchV3.hud('🔔 HUD 测试', '看到这行字 = 提示层正常 · 1.6 秒后消失', 0.5, 'center');
+    toast('🔔 已弹出 HUD 测试');
+  });
+  Bus.register('touchV3Unlock', () => { CFG.touchLockRate = 0; save(); TouchV3.writeRate(1); toast('已解除触控锁定 · 1×'); });
+  Bus.register('brightReset', () => { CORE.bright.value = 1;
+    try { document.documentElement.classList.remove('bpe-bright');
+      document.documentElement.style.removeProperty('--bpe-bright'); } catch (e) {}
+    toast('☀ 画面亮度已复位'); });
+
+  const WebFull = {
+    btn() { return biliFullscreenBtn(); },
+    isOn() { return isBiliFullscreen(); },
+    toggle(why) {
+      const b = this.btn();
+      if (!b) {
+        toast('未找到 B 站「网页全屏」按钮 · 请点播放器右下角全屏图标');
+        LOG('Full', '未找到网页全屏按钮 · ' + (why || ''));
+        return false;
+      }
+      try { b.click(); } catch (e) { toast('网页全屏按钮点击失败：' + e.message); return false; }
+      LOG('Full', '转发 B 站网页全屏按钮（不改 DOM 布局）· ' + (why || ''));
+      return true;
+    },
+    enterIfOff(why) { return this.isOn() ? true : this.toggle(why); }
+  };
+  /* 硬禁用系统全屏：吞掉 Fullscreen API / iOS 原生视频全屏，不抛错、不进系统层。
+     只改这两个方法，不碰任何 click 传播 —— v2.0.5 的教训：掐断 B 站事件
+     会让站内导航降级成整页跳转，进而触发 Universal Link 跳 App。 */
+  (function blockSystemFullscreen() {
+    const swallow = (name) => {
+      const proto = (name === 'webkitEnterFullscreen') ? (window.HTMLVideoElement && HTMLVideoElement.prototype) : (window.Element && Element.prototype);
+      if (!proto || !proto[name]) return;
+      try {
+        Object.defineProperty(proto, name, {
+          configurable: true, writable: true,
+          value: function () {
+            CORE.sysFullBlocked++;
+            LOG('Full', '已拦截 ' + name + '（系统全屏已弃用）');
+            return typeof Promise !== 'undefined' ? Promise.resolve() : undefined;
+          }
+        });
+      } catch (e) { LOG('Full', '拦截 ' + name + ' 失败：' + e.message); }
+    };
+    /* v2.3.0 更正：iPadOS 16.4+ 确实支持 Element.requestFullscreen()，
+       元素全屏时网页 DOM 仍在、触摸事件能进页面 JS（WebKit Bugzilla 328773）。
+       只吞 HTMLVideoElement.webkitEnterFullscreen —— 那一层才把画面交给
+       原生播放器、网页收不到触摸。之前三个一起吞，等于把唯一可用路径封死。 */
+    if (window.HTMLVideoElement) swallow('webkitEnterFullscreen');
+    /* 只在【原生播放器全屏】时退出；元素全屏（document.fullscreenElement）
+       是 iPad 上唯一能保持 DOM / 触摸可达的全屏，绝不再自动 exit 它。 */
+    const exitNativePlayer = () => {
+      try {
+        const v = findVideo && findVideo();
+        if (v && v.webkitPresentationMode === 'fullscreen') {
+          if (v.webkitExitFullscreen) v.webkitExitFullscreen();
+          LOG('Full', '已退出原生播放器全屏（网页收不到触摸的那一层）');
+        }
+      } catch (e) {}
+    };
+    document.addEventListener('fullscreenchange', () => {
+      CORE.fsElementFull = !!(document.fullscreenElement || document.webkitFullscreenElement);
+      LOG('Full', '元素全屏 = ' + CORE.fsElementFull + '（DOM 保留，触控继续可用）');
+    }, true);
+    setTimeout(exitNativePlayer, 600);
+    /* 点 B 站「系统全屏」按钮 → 精确改道到「网页全屏」按钮。
+       只针对这一颗按钮 preventDefault / stopImmediatePropagation，不碰其它
+       click —— v2.0.5 的教训是「全局掐断 B 站事件会让站内导航降级成整页
+       跳转，反而触发 Universal Link 跳 App」，这里精确到按钮所以安全。
+       命中网页全屏按钮本身则完全放行，避免双重 toggle 把画面退出去。 */
+    document.addEventListener('click', e => {
+      const t = e.target; if (!t || !t.closest) return;
+      let webHit = false, sysHit = false;
+      try {
+        webHit = !!t.closest('.bpx-player-ctrl-web-fullscreen,[class*="web-fullscreen"],' +
+          '[title*="网页全屏"],[aria-label*="网页全屏"]');
+        if (!webHit) sysHit = !!t.closest('.bpx-player-ctrl-full,.bpx-player-ctrl-fullscreen,' +
+          '[class*="ctrl-full"],[class*="btn-fullscreen"],' +
+          'button[title*="全屏"],[aria-label*="全屏"]');
+      } catch (_) {}
+      if (webHit) { setTimeout(exitNativePlayer, 0); return; }   // B 站自切网页全屏，脚本不插手
+      if (sysHit) {
+        // 防递归：找不到网页全屏按钮时 fallback 可能也返回系统按钮，
+        // 而 WebFull.toggle 里的 b.click() 会再派发一次 click 回到这里。
+        if (CORE.fsRedirecting) return;
+        CORE.fsRedirecting = true;
+        try { e.preventDefault(); e.stopImmediatePropagation(); } catch (_) {}
+        try { WebFull.toggle('系统全屏按钮改道网页全屏'); } finally {
+          setTimeout(() => { CORE.fsRedirecting = false; }, 0);
+        }
+      }
+    }, { capture: true, passive: false });
+  })();
+
   function biliFullscreenBtn() {
-    let el = firstMatch([
-      '.bpx-player-ctrl-full', '.bpx-player-ctrl-fullscreen',
-      '.bpx-player-ctrl-web-fullscreen', '[class*="ctrl-full"]',
-      '.bilibili-player-video-btn-fullscreen', '[class*="btn-fullscreen"]',
-      '[class*="web-fullscreen"]', 'button[title*="全屏"]', '[aria-label*="全屏"]',
-      '[title*="全屏"]', '[aria-label*="Full Screen"]', '[aria-label*="fullscreen"]'
-    ]);
+    const webSels = ['.bpx-player-ctrl-web-fullscreen', '[class*="web-fullscreen"]',
+      '[title*="网页全屏"]', '[aria-label*="网页全屏"]', '[data-title*="网页全屏"]'];
+    let el = firstMatch(webSels);
     if (el) return el;
     // 兜底：播放器常在 shadow DOM 里，遍历所有 root 找「名字含 full/全屏」的可点击控件
     try {
-      const out = [];
+      const web = [], other = [];
       collectRoots().forEach(r => {
         try {
           r.querySelectorAll('button,[role="button"],[class*="ctrl"],[class*="btn"],svg').forEach(e => {
             const sig = (typeof e.className === 'string' ? e.className : '') + ' ' +
               (e.getAttribute && (e.getAttribute('title') || '')) + ' ' +
               (e.getAttribute && (e.getAttribute('aria-label') || ''));
-            if (/full|全屏/i.test(sig) && !/exit|退出/i.test(sig)) out.push(e);
+            if (/full|全屏/i.test(sig) && !/exit|退出/i.test(sig)) {
+              if (/web-full|网页全屏/i.test(sig)) web.push(e); else other.push(e);
+            }
           });
         } catch (_) {}
       });
-      if (out.length) return out[out.length - 1];   // 控制栏按钮通常靠后
+      // 网页全屏优先；实在没有才用系统全屏按钮（其 requestFullscreen 已被吞）
+      if (web.length) return web[0];
+      if (other.length) return other[other.length - 1];
     } catch (e) {}
     return null;
   }
@@ -1210,8 +2877,11 @@
   function biggestPlayerRect() {
     const v = findVideo(); if (!v) return null;
     let el = v, best = null;
-    for (let i = 0; i < 9 && el && el.parentElement; i++) {
+    for (let i = 0; i < 6 && el && el.parentElement; i++) {
       el = el.parentElement;
+      // v2.1.4：body / html 本来就是 100vw 宽且常常高于视口，算进去会让
+      // 普通观看页被误判成「已全屏」→ 铺满增强与整屏热区提前生效。
+      if (el === document.body || el === document.documentElement) break;
       if (!el.getBoundingClientRect) continue;
       const r = el.getBoundingClientRect();
       if (!best || (r.width * r.height) > (best.width * best.height)) best = r;
@@ -1287,6 +2957,8 @@
     if (!silent) toast('🧹 已复位全屏状态');
   }
   function fillWatchdog() {
+    // v2.1.4：撤回容器级布局强改，铺满只走 v1.2 的 <video> inline object-fit
+    // （不改容器 / 不改祖先链 / 不加黑底，结构上不可能黑屏或撑破布局）。
     if (!CFG.enabled) { if (Fill.active) resetVideoFill(true); return; }
     const full = isBiliFullscreen();
     if (full && CFG.fillEnabled) applyVideoFill();
@@ -1294,23 +2966,14 @@
     else if (full && !CFG.fillEnabled && Fill.active) resetVideoFill(true);
   }
   Bus.register('fullscreen', () => {
-    // F 永远有效：只转发 B 站自己的全屏按钮，跟「铺满增强」开关完全解耦
-    const btn = biliFullscreenBtn();
-    if (!btn) {
-      // 不 return 死：watchdog 仍在跑，用户点 B 站自己的全屏按钮后铺满照样自动生效
-      toast('未找到全屏按钮 → 请点播放器右下角的全屏图标，铺满会自动生效');
-      setTimeout(fillWatchdog, 200); setTimeout(fillWatchdog, 700);
-      return;
-    }
-    try { btn.click(); } catch (e) { toast('全屏按钮点击失败：' + e.message); return; }
-    LOG('Full', '转发 B 站全屏按钮（不接管 DOM）');
+    // v2.1.4：只点 B 站自己的「网页全屏」按钮，绝不改播放器 DOM 布局。
+    // B 站全屏按钮是 toggle，所以不预判进退，只如实说「已切换」。
+    if (!WebFull.toggle('F 键')) return;
+    toast('⛶ 已切换 B 站网页全屏 · 手指长按 2× / 左亮度 / 右音量');
     setTimeout(fillWatchdog, 200);
     setTimeout(fillWatchdog, 700);
-    setTimeout(() => {
-      if (isBiliFullscreen()) toast('全屏 · ' + (CFG.fillEnabled ? '铺满 ' + currentMode() : 'B 站原生（铺满增强已关）'));
-      else toast('已退出全屏');
-    }, 740);
   });
+  Bus.register('webFullToggle', () => Bus.exec('fullscreen'));
   Bus.register('fillToggle', () => {
     const order = ['auto', 'cover', 'contain'];
     CFG.fillMode = order[(order.indexOf(CFG.fillMode) + 1) % 3];
@@ -1320,15 +2983,6 @@
     toast('填充模式：' + ({ auto: '智能（横屏裁切 / 竖屏完整）', cover: '裁切铺满', contain: '适应（带黑边）' }[CFG.fillMode]));
   });
   Bus.register('fillReset', () => { resetVideoFill(true); toast('🧹 全屏状态已复位，video 样式已还原'); });
-  Bus.register('nativeFullscreen', () => {
-    const v = findVideo(); if (!v) return toast('未找到视频');
-    if (typeof v.webkitEnterFullscreen !== 'function') return toast('此设备不支持原生视频全屏');
-    showConfirm('原生播放器全屏会把画面交给系统接管：网页弹幕、控制栏和所有快捷键都会失效，退出要靠系统手势。仍要继续？', () => {
-      resetVideoFill(true);
-      try { v.webkitEnterFullscreen(); LOG('Full', '用户主动进入原生播放器全屏'); }
-      catch (e) { toast('原生全屏失败：' + e.message); }
-    });
-  });
 
   /* ============================================================
    * 10. 快捷键命令实现
@@ -1336,7 +2990,8 @@
   Bus.register('rateUp', () => stepRate(1));
   Bus.register('rateDown', () => stepRate(-1));
   function stepRate(dir) {
-    const v = findVideo(); if (!v) return toast('未找到视频');
+    // v2.1.0：curVideo 已是 findVideo 的缓存，按键不再全量 deepFind 扫 DOM
+    const v = curVideo || findVideo(); if (!v) return toast('未找到视频');
     const list = CFG.rateList.slice().sort((a, b) => a - b);
     const cur = v.playbackRate;
     let next;
@@ -1369,6 +3024,564 @@
     });
     copyText(JSON.stringify(d, null, 2));
     toast('已复制倍速诊断 · 看 official3xSeen / rememberedRate');
+    render();
+  });
+
+  /* ============================================================
+   * v2.1.0 · 触控倍速（长按 2× / 按住到时锁定 / 上下滑调档）
+   * ------------------------------------------------------------
+   * 查证与实现约束：
+   * ① B 站 App / 微信视频号的「按住画面 2×、松手回原速」是触屏标配，
+   *    但请求桌面网站时的 B 站网页播放器没有这套手势；Greasy Fork 的
+   *    bilibili-touch-enhancer、zwplayer 也都自己写长按计时器 + touch 监听。
+   * ② KodeLab《iOS Safari Canvas 触控事件踩坑》真机结论：
+   *    touch-action:none 不可靠、合成 touchstart 的 preventDefault 受 passive
+   *    限制无效；更关键「不 preventDefault 时 Pointer Events 正常继续，
+   *    preventDefault 反而触发 pointercancel，后续事件全部消失」。
+   *    → 本模块一律 {capture:true, passive:true}，绝不 preventDefault /
+   *      stopPropagation；pointercancel 当作「放弃本次手势」回原速。
+   * ③ 每次写 playbackRate 都打到音频解码器 → 滑动调档全部经 Rate.set
+   *    的 rAF 合并，同一帧只写最后一次。
+   * ④ 只在「视频画面热区」启动：排除控制栏 / 输入框 / 按钮 / 链接 /
+   *    脚本自己的 shadow UI / 设置面板 / 搜索浮层；全屏时放宽到整屏。
+   *    短按完全不碰播放状态，B 站原生单击暂停、双击全屏照常。
+   * ============================================================ */
+  /* ============================================================
+   * v2.1.2 · 移动端手势（触控倍速 + 左亮度 / 右音量）
+   * ------------------------------------------------------------
+   * 为什么上一版手指长按「还是没用」——三处叠加，逐条修：
+   * ① iPad Safari 长按画面约 500ms 会弹「拷贝 / 保存图像」系统 callout，
+   *    同时派发 touchcancel；旧版把 touchcancel 一律当放弃手势 → 回原速。
+   *    → PAGE_CSS 给播放器画面根加 .bpe-touchzone 关掉 callout / 选择；
+   *      且已激活的手势即使收到 touchcancel 也按正常结算，不误杀。
+   * ② Rate.correct() 里写了 `if (touchRate.active) return`，把「触控期间
+   *    被 B 站 / 其它脚本在 ratechange 回调里改回 1×」一并放过 → 长按
+   *    写 2× 后立刻被覆盖。→ 已移除，触控期间照常校正到 intent。
+   * ③ Rate.set 只排 rAF，iPad 全屏播放时 rAF 会被节流甚至暂停 → 那一帧
+   *    迟迟不执行。→ 加 90ms watchdog 兜底，flush 幂等仍只写一次。
+   * 另：系统全屏 (Fullscreen API) 会弹「向下轻扫退出」并截留触摸，
+   *    也是手势失效的原因；F 已改为优先 B 站「网页全屏」。
+   *
+   * 交互规格（向 B 站移动版靠拢）：
+   *  · 单指上下滑（未到长按时长）：左半屏=画面视觉亮度，右半屏=音量
+   *  · 长按：未锁定→临时 2×；已锁定→临时回 1× 原速；松手恢复手势前状态
+   *  · 按住到 N 秒：锁定当前临时倍速
+   *  · 长按中上滑：升档，松手锁定当前档
+   *  · 长按中下滑再松开：唯一「恢复原速 / 解除锁定」的手势
+   * HUD 贴画面上方边缘的小胶囊，不挡中央，1.6s 自动淡出。
+   * ============================================================ */
+  const Touch = {
+    session: null, hudTimer: null,
+    cfg() {
+      return {
+        enabled: !!CFG.touchRate,
+        bvEnabled: !!CFG.touchBrightVolume,
+        holdMs: Math.min(1200, Math.max(120, Number(CFG.touchHoldMs) || 280)),
+        lockSec: Math.min(60, Math.max(3, Number(CFG.touchLockSec) || 10)),
+        slidePx: Math.min(160, Math.max(16, Number(CFG.touchSlidePx) || 44)),
+        slideLocks: !!CFG.touchSlideLocks
+      };
+    },
+    hud() { return sr ? sr.querySelector('.bpe-touch-hud') : null; },
+    lockEl() { return sr ? sr.querySelector('.bpe-rate-lock') : null; },
+    /* side=left / right / center；pct=0~1 时显示 B 站移动版风格细进度条 */
+    showHud(main, sub, pct, side, sticky) {
+      const h = this.hud(); if (!h) return;
+      h.classList.remove('left', 'right', 'center');
+      h.classList.add(side || 'center');
+      const m = h.querySelector('.bpe-th-main'), u = h.querySelector('.bpe-th-sub');
+      const bar = h.querySelector('.bpe-th-bar');
+      const fill = bar ? (bar.firstElementChild || bar.querySelector('i')) : null;
+      if (m) m.textContent = main;
+      if (u) u.textContent = sub || '';
+      if (bar) bar.hidden = !(typeof pct === 'number');
+      if (fill && typeof pct === 'number') fill.style.width = Math.max(0, Math.min(100, pct * 100)) + '%';
+      h.hidden = false;
+      raf(() => h.classList.add('on'));
+      if (this.hudTimer) { clearTimeout(this.hudTimer); this.hudTimer = null; }
+      if (!sticky) {
+        this.hudTimer = setTimeout(() => {
+          this.hudTimer = null;
+          if (!this.session) this.hideHud();
+        }, 1600);
+      }
+    },
+    hideHud() {
+      const h = this.hud(); if (h) { h.classList.remove('on'); h.hidden = true; }
+      if (this.hudTimer) { clearTimeout(this.hudTimer); this.hudTimer = null; }
+    },
+    showLock(rate) {
+      const b = this.lockEl(); if (!b) return;
+      b.textContent = '🔒 ' + rate + '× · 点按解除';
+      b.hidden = false;
+    },
+    hideLock() { const b = this.lockEl(); if (b) b.hidden = true; },
+    /* 收窄的排除列表（v2.1.1）：只排标准可交互元素 + 具体控制条类名 */
+    isInteractive(t) {
+      if (!t || !t.closest) return false;
+      try {
+        return !!t.closest('input,textarea,select,button,a,[contenteditable="true"],' +
+          '[role="button"],[class*="bpe-"],' +
+          '[class*="control-bottom"],[class*="ctrl-bottom"],[class*="ctrl-btn"],' +
+          '[class*="ctrl-setting"],[class*="ctrl-quality"],[class*="ctrl-time"],' +
+          '[class*="progress"],[class*="dm-input"],[class*="inputbar"],[class*="sendbar"],' +
+          '[class*="bili-header"],[class*="nav-search"]');
+      } catch (e) { return true; }
+    },
+    /* 从当前 <video> 向上找播放器根，不依赖固定类名；顺手标记 touchzone */
+    playerRoot() {
+      const v = curVideo || findVideo();
+      if (!v) return null;
+      let best = null, n = v, hop = 0;
+      while (n && hop < 8) {
+        const cname = String(n.className || '');
+        if (/bpx-player|bilibili-player|player-(container|wrap|primary|video|area|row)/i.test(cname)) best = n;
+        n = n.parentElement; hop++;
+      }
+      return best || v.parentElement || v;
+    },
+    ensureTouchZone() {
+    if (TOUCH_OFF) return;   // 不给 video 父级加 touch-action:none
+      // v2.1.4：只给 <video> 的直接父级加 class（关 iPad 长按 callout +
+      // 给 video 设 touch-action:none）。这个类不改任何定位 / 尺寸 / 层级，
+      // 绝不会像 v2.1.3 的 .bpe-webfull 那样撑坏 B 站布局。
+      try {
+        const v = curVideo || findVideo();
+        const el = v && v.parentElement;
+        if (el && el.classList && !el.classList.contains('bpe-touchzone')) {
+          el.classList.add('bpe-touchzone');
+          CORE.touchZoneEl = el;
+          LOG('Touch', '已标记 video 父级 · 关闭 iPad 长按系统菜单');
+        }
+      } catch (e) {}
+    },
+    /* v2.1.4 · 几何热区：只看 <video> 在屏幕上的位置，完全不猜 B 站类名、
+       不依赖容器结构、不依赖 .bpe-webfull。这样无论 B 站是普通观看、宽屏、
+       网页全屏还是改版，只要 video 在画面上，手指按那块就能起手势。 */
+    inVideoArea(e) {
+      const t = e.target; if (!t) return false;
+      if (this.isInteractiveStrict(t)) return false;
+      const v = curVideo || findVideo() ||
+        (document.querySelector ? document.querySelector('video') : null);
+      if (!v || !v.getBoundingClientRect) return false;
+      let r = null;
+      try { r = v.getBoundingClientRect(); } catch (_) { return false; }
+      const W = window.innerWidth || 1366, H = window.innerHeight || 1024;
+      const x = e.clientX, y = e.clientY;
+      const root = this.playerRoot();
+      let rr = null;
+      if (root && root.getBoundingClientRect) {
+        try { rr = root.getBoundingClientRect(); } catch (_) {}
+      }
+      // ① 网页全屏 / 宽屏：video 或播放器根容器接近铺满视口 → 整屏都是热区。
+      //    只看这两个 rect，不用 isBiliFullscreen()（它可能被 body 之类的大祖先误命中）。
+      if (r.width >= W * 0.86 && r.height >= H * 0.70) return true;
+      if (rr && rr.width >= W * 0.90 && rr.height >= H * 0.85) return true;
+      // ② 普通观看：落点在 video 矩形内（放宽 14px，覆盖弹幕 / 遮罩层）。
+      //    用 left+width / top+height 计算边界，不依赖 DOMRect 的 right/bottom
+      //    （某些 WebKit 版本 / 伪对象可能不给这两个字段）。
+      if (r.width > 0 && r.height > 0 &&
+          x >= r.left - 14 && x <= r.left + r.width + 14 &&
+          y >= r.top - 14 && y <= r.top + r.height + 14) return true;
+      // ③ 兜底：落点在播放器根容器矩形内
+      if (rr && rr.width > 0 && rr.height > 0 &&
+          x >= rr.left && x <= rr.left + rr.width &&
+          y >= rr.top && y <= rr.top + rr.height) return true;
+      return false;
+    },
+    /* v2.1.3：网页全屏态只排「真控件」，不再猜播放器类名。
+       系统全屏时 <video> 会脱离 DOM / 被系统接管，旧的 playerRoot() 猜不到 →
+       长按、亮度、音量全部拒绝启动，这就是「啥也没有」。 */
+    isInteractiveStrict(t) {
+      if (!t || !t.closest) return false;
+      try {
+        return !!t.closest('input,textarea,select,button,a,[contenteditable="true"],' +
+          '[role="button"],[class*="bpe-"],[class*="ctrl-btn"],[class*="progress"],' +
+          '[class*="dm-input"],[class*="inputbar"],[class*="sendbar"]');
+      } catch (e) { return true; }
+    },
+    canStart(e) {
+      const c = this.cfg();
+      const P = CORE.touchProbe;
+      const rej = (r) => { P.lastReject = r; return false; };
+      if (!CFG.enabled || !(c.enabled || c.bvEnabled)) return rej('总开关或触控开关关闭');
+      if (this.session) return rej('已有手势会话');
+      if (e.pointerType === 'mouse' && e.button !== 0) return rej('鼠标非左键');
+      if (e.isPrimary === false) return rej('非主指针');
+      if (e.touchCount && e.touchCount > 1) return rej('多指');
+      if (CORE.officialHold && CORE.officialHold.active) return rej('官方长按 3× 期间让位');
+      if (sr) {
+        const panel = sr.querySelector('.bpe-panel'), search = sr.querySelector('.bpe-search');
+        if ((panel && !panel.hidden) || (search && !search.hidden)) return rej('设置面板 / 搜索浮层打开');
+      }
+      /* v2.1.5 关键修复：旧版写的是 `path.some(n => n.nodeType === 11) return false`，
+         本意「排除脚本自己的 Shadow DOM UI」，但 B 站播放器大量使用 shadow root /
+         Web Components —— 手指落在弹幕层、遮罩层等 shadow 内元素时，composedPath()
+         必然含 nodeType=11，于是每一次触摸都被无条件拒绝。这就是前面几版改热区
+         判定却始终「一个手势都没有」的直接代码级原因。
+         现在只排除脚本自己的 shadow root（sr），其它 shadow 一律放行。 */
+      const path = (e.composedPath && e.composedPath()) || [e.target];
+      if (path.some(n => n && n === sr)) return rej('落在脚本自身 UI 内');
+      // v2.1.7：控件洞统一让行 —— 不只手势层，window 前置桥 / document /
+      // 元素层转发进来的事件也要守同一条规则，否则点进度条会被判成亮度/音量手势。
+      if (typeof GestureLayer !== 'undefined' && GestureLayer.isHole(e.clientX, e.clientY))
+        return rej('落在控件让行区（控制栏 / 输入框 / 进度条）');
+      // v2.1.4：统一走几何热区（inVideoArea 内部已排真控件，与 DOM 结构无关）
+      if (!this.inVideoArea(e)) return rej('落点不在 video / 播放器几何热区内');
+      P.lastReject = null;
+      P.startAccepted++;
+      return true;
+    },
+    stepFrom(base, steps) {
+      const list = CFG.rateList.slice().sort((a, b) => a - b);
+      let idx = list.findIndex(r => Math.abs(r - base) < 0.001);
+      if (idx < 0) { idx = 0; while (idx < list.length - 1 && list[idx] < base) idx++; }
+      return list[Math.min(list.length - 1, Math.max(0, idx + steps))];
+    },
+    start(e) {
+      if (TOUCH_OFF) return;   // v2.2.0：任何残留路径都不启动触控状态机
+      if (!this.canStart(e)) return;
+      const v = curVideo || findVideo() || (document.querySelector ? document.querySelector('video') : null);
+      if (!v) { LOG('Touch', '未找到 <video>，本次手势不启动'); return; }
+      this.ensureTouchZone();
+      const c = this.cfg();
+      const locked = Number(CFG.touchLockRate) || 0;
+      CORE.touchLock = { rate: locked };
+      const s = this.session = {
+        pointerId: e.pointerId, source: e.kind === 'touch' ? 'touch' : 'pointer',
+        touchSeen: e.kind === 'touch', startY: e.clientY, startX: e.clientX,
+        baseRate: v.playbackRate, lockedRate: locked,
+        rateBase: locked > 0 ? 1 : 2, targetRate: locked > 0 ? 1 : 2,
+        mode: 'pending', active: false, moved: false, slidRate: false, slidDown: false,
+        steps: 0, startedAt: Date.now(), video: v,
+        brightBase: CORE.bright.value, volBase: v.volume,
+        holdTimer: null, lockTimer: null, tickTimer: null
+      };
+      CORE.touchRate = { active: false, session: 'pending', rate: s.baseRate };
+      s.holdTimer = setTimeout(() => this.activateRate(s), c.holdMs);
+      s.lockTimer = setTimeout(() => this.lockNow(s, '按住到时'), c.lockSec * 1000);
+      LOG('Touch', '按下画面 · 待判长按 / 左右分区滑动');
+    },
+    /* 长按到时：未锁定→临时 2×；已锁定→临时回 1× 原速 */
+    activateRate(s) {
+      if (this.session !== s || s.active || s.mode !== 'pending') return;
+      if (!this.cfg().enabled) { s.mode = 'none'; return; }
+      s.mode = 'rate'; s.active = true;
+      s.video = curVideo || findVideo() || s.video;
+      CORE.touchRate = { active: true, session: s.lockedRate > 0 ? 'hold-normal' : 'hold', rate: s.rateBase };
+      Rate.set(s.video, s.rateBase, { quiet: true, tag: '触控' });
+      const c = this.cfg();
+      if (s.lockedRate > 0) {
+        this.showHud('↩︎ 临时原速 1×', '已锁定 ' + s.lockedRate + '× · 松手恢复 · 下滑松手可解锁', null, 'center', true);
+      } else {
+        this.showHud('⚡ 2× 倍速中', '松手回 ' + s.baseRate + '× · 上滑升档 · 下滑松手回原速', null, 'center', true);
+      }
+      s.tickTimer = setInterval(() => {
+        if (this.session !== s || s.locked) { clearInterval(s.tickTimer); s.tickTimer = null; return; }
+        const left = Math.max(0, c.lockSec - Math.floor((Date.now() - s.startedAt) / 1000));
+        if (!s.slidDown && !s.slidRate && left > 0) {
+          this.showHud(s.lockedRate > 0 ? '↩︎ 临时原速 1×' : '⚡ ' + s.targetRate + '×',
+            '再按 ' + left + 's 锁定 · 松手恢复', null, 'center', true);
+        }
+      }, 1000);
+      LOG('Touch', s.lockedRate > 0 ? '已锁定态长按 → 临时回 1×（松手恢复锁定档）' : '已进入临时 2×');
+    },
+    /* 未到长按时长就滑动 → 左半屏亮度 / 右半屏音量，完全不碰倍速 */
+    startSlide(s, e) {
+      const c = this.cfg();
+      if (s.holdTimer) { clearTimeout(s.holdTimer); s.holdTimer = null; }
+      if (s.lockTimer) { clearTimeout(s.lockTimer); s.lockTimer = null; }
+      if (!c.bvEnabled) { s.mode = 'none'; return; }
+      s.mode = (s.startX < (window.innerWidth || 1366) / 2) ? 'bright' : 'volume';
+      CORE.touchRate = { active: false, session: s.mode, rate: s.baseRate };
+      LOG('Touch', '进入' + (s.mode === 'bright' ? '左半屏亮度' : '右半屏音量') + '手势');
+    },
+    applySlide(s, e) {
+      const dy = s.startY - e.clientY;
+      if (s.mode === 'bright') {
+        const x = Math.max(0.3, Math.min(1.6, s.brightBase + dy / 300));
+        CORE.bright.value = x;
+        document.documentElement.classList.add('bpe-bright');
+        document.documentElement.style.setProperty('--bpe-bright', x.toFixed(2));
+        this.showHud('☀ 亮度 ' + Math.round(x / 1.6 * 100) + '%',
+          '左半屏上下滑 · 画面视觉亮度（不动系统亮度）', x / 1.6, 'left');
+      } else if (s.mode === 'volume') {
+        const v = curVideo || findVideo() || s.video;
+        if (volumeIsSettable()) {
+          const x = Math.max(0, Math.min(1, s.volBase + dy / 300));
+          CORE.applyingVolume = true;
+          try { v.volume = x; } catch (_) {}
+          setTimeout(() => { CORE.applyingVolume = false; }, 0);
+          this.showHud('🔊 音量 ' + Math.round(x * 100) + '%', '右半屏上下滑', x, 'right');
+        } else {
+          /* iPad Safari：volume 只读恒为 1，系统音量只由侧键/控制中心控制。
+             不写假数值、不骗用户说已调节，只给明确指引。 */
+          this.showHud('🔊 音量由系统控制', 'iPad 请用侧键 / 控制中心 · 网页无权读写', null, 'right');
+        }
+      }
+    },
+    move(e) {
+      const s = this.session;
+      if (!s) return;
+      const c = this.cfg();
+      const dy = s.startY - e.clientY;
+      // ① 未激活倍速 + 竖向位移过阈值 → 判定亮度 / 音量
+      if (s.mode === 'pending' && !s.active) {
+        if (Math.abs(dy) < 12) {
+          // 横向滑动（快进 / 拖进度）完全不接管，且清掉长按计时器避免白跑
+          if (Math.abs(e.clientX - s.startX) > 24) {
+            s.moved = true; s.mode = 'none';
+            [s.holdTimer, s.lockTimer].forEach(t => { if (t) { clearTimeout(t); } });
+            s.holdTimer = s.lockTimer = null;
+          }
+          return;
+        }
+        s.moved = true;
+        this.startSlide(s, e);
+      }
+      if (s.mode === 'bright' || s.mode === 'volume') { this.applySlide(s, e); return; }
+      if (s.mode !== 'rate' || !s.active) return;
+      // ② 倍速态：上滑升档；下滑 = 解锁回原速专用手势
+      const steps = Math.max(-8, Math.min(8, Math.trunc(dy / c.slidePx)));
+      if (steps === s.steps) return;
+      s.steps = steps;
+      if (steps < 0) {
+        s.slidDown = true; s.slidRate = false;
+        s.targetRate = 1;
+        this.showHud('↩︎ 松手恢复原速', '下滑松手 = 解除锁定并回到 1×', null, 'center', true);
+        LOG('Touch', '下滑 → 松手将解除锁定回到 1×');
+        return;
+      }
+      if (steps === 0) return;
+      s.slidRate = true; s.slidDown = false;
+      s.targetRate = this.stepFrom(s.rateBase, steps);
+      s.video = curVideo || findVideo() || s.video;
+      Rate.set(s.video, s.targetRate, { quiet: true, tag: '触控升档' });
+      CORE.touchRate = { active: true, session: 'hold', rate: s.targetRate };
+      this.showHud('⚡ ' + s.targetRate + '×', '松手锁定当前档 · 上滑继续升', null, 'center', true);
+      LOG('Touch', '上滑 ' + steps + ' 档 → ' + s.targetRate + '×');
+    },
+    lockNow(s, why) {
+      if (this.session !== s || s.locked || s.mode !== 'rate') return;
+      if (!s.active) this.activateRate(s);
+      if (s.slidDown) return;                       // 下滑松手才解锁，不被定时锁定抢先
+      s.locked = true;
+      const rate = s.slidRate ? s.targetRate : s.rateBase;
+      CFG.rate = rate; CFG.touchLockRate = rate; save();
+      CORE.touchLock = { rate: rate };
+      CORE.touchRate = { active: true, session: 'locked', rate: rate };
+      s.video = curVideo || findVideo() || s.video;
+      Rate.set(s.video, rate, { quiet: true, tag: '触控锁定' });
+      this.showHud(rate === 1 ? '🔓 已回到 1× 原速' : '🔒 已锁定 ' + rate + '×',
+        rate === 1 ? '原速已生效' : '松手仍保持 · 长按可临时回原速', null, 'center', true);
+      if (rate !== 1) this.showLock(rate); else this.hideLock();
+      toast(rate === 1 ? '🔓 已回到 1× 原速' : '🔒 已锁定 ' + rate + '×（' + why + '）');
+      LOG('Touch', '倍速已锁定 ' + rate + '× · ' + why);
+    },
+    unlockToNormal(s) {
+      CFG.rate = 1; CFG.touchLockRate = 0; save();
+      CORE.touchLock = { rate: 0 };
+      s.video = curVideo || findVideo() || s.video;
+      Rate.set(s.video, 1, { quiet: true, tag: '下滑解锁' });
+      this.hideLock();
+      return 1;
+    },
+    end(e, cancelled) {
+      const s = this.session;
+      if (!s) return;
+      // v2.1.2：已激活的手势即使被 touchcancel 打断也按正常结算，
+      // 否则 iPad 残留的系统 callout 仍会毁掉一次有效长按。
+      if (cancelled && s.mode === 'rate' && s.active) cancelled = false;
+      this.session = null;
+      [s.holdTimer, s.lockTimer].forEach(t => { if (t) clearTimeout(t); });
+      if (s.tickTimer) { clearInterval(s.tickTimer); s.tickTimer = null; }
+      const c = this.cfg();
+      let result = '短按 / 未触发', finalRate = s.baseRate;
+
+      if (s.mode === 'bright' || s.mode === 'volume') {
+        result = s.mode === 'bright' ? '亮度已调整（画面视觉）' : '音量手势（iPad 由系统控制）';
+        finalRate = s.baseRate;
+        CORE.touchDiag = { at: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
+          result: result, mode: s.mode, source: s.source, touchSeen: s.touchSeen,
+          bright: CORE.bright.value, volumeSettable: volumeIsSettable() };
+      } else if (s.mode === 'rate' && s.active) {
+        s.video = curVideo || findVideo() || s.video;
+        if (!cancelled && s.slidDown) {
+          finalRate = this.unlockToNormal(s);
+          result = '下滑松手 → 已解除锁定回到 1×';
+        } else if (!cancelled && s.locked) {
+          finalRate = Number(CFG.touchLockRate) || s.rateBase;
+          Rate.set(s.video, finalRate, { quiet: true, tag: '锁定保持' });
+          if (finalRate !== 1) this.showLock(finalRate);
+          result = '锁定保持 ' + finalRate + '×';
+        } else if (!cancelled && s.slidRate && c.slideLocks) {
+          finalRate = s.targetRate;
+          CFG.rate = finalRate; CFG.touchLockRate = finalRate; save();
+          CORE.touchLock = { rate: finalRate };
+          Rate.set(s.video, finalRate, { quiet: true, tag: '上滑锁定' });
+          this.showLock(finalRate);
+          result = '上滑松手 → 已锁定 ' + finalRate + '×';
+        } else {
+          // 纯长按：松手恢复「手势前状态」——已锁定回锁定档，未锁定回原档
+          finalRate = s.lockedRate > 0 ? s.lockedRate : s.baseRate;
+          Rate.set(s.video, finalRate, { quiet: true, tag: '松手恢复' });
+          if (s.lockedRate > 0) this.showLock(s.lockedRate); else this.hideLock();
+          result = cancelled ? '系统打断 → 已恢复手势前状态'
+            : (s.lockedRate > 0 ? '临时原速结束 → 恢复锁定 ' + finalRate + '×' : '临时 2× 结束 → 恢复 ' + finalRate + '×');
+        }
+        CORE.touchDiag = { at: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
+          result: result, rate: finalRate, baseRate: s.baseRate,
+          lockedRate: s.lockedRate, steps: s.steps, downSlide: s.slidDown,
+          source: s.source, touchSeen: s.touchSeen };
+      }
+      this.hideHud();
+      CORE.touchRate = { active: false, session: 'idle', rate: finalRate };
+      LOG('Touch', (cancelled ? '手势结束（打断）→ ' : '松手 → ') + result);
+    },
+    unlock(why) {
+      if (this.session) this.end(null, true);
+      CFG.rate = 1; CFG.touchLockRate = 0; save();
+      CORE.touchLock = { rate: 0 };
+      const v = curVideo || findVideo();
+      if (v) Rate.set(v, 1, { quiet: true, tag: '解除锁定' });
+      this.hideLock(); this.hideHud();
+      CORE.touchRate = { active: false, session: 'idle', rate: 1 };
+      CORE.touchDiag = Object.assign({}, CORE.touchDiag || {}, {
+        unlockedAt: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
+        unlockedTo: 1, unlockReason: why || '手动'
+      });
+      toast('🔓 已解除锁定 · 回到 1× 原速');
+      LOG('Touch', '解除锁定 → 1× · ' + (why || '手动'));
+    },
+    resetBright() {
+      CORE.bright.value = 1;
+      try {
+        document.documentElement.classList.remove('bpe-bright');
+        document.documentElement.style.removeProperty('--bpe-bright');
+      } catch (e) {}
+      this.showHud('☀ 亮度已复位 100%', '画面视觉亮度恢复默认', 1 / 1.6, 'left');
+    }
+  };
+  /* ============================================================
+   * v2.1.5 · 触控事件层：window → document → 元素，三层捕获并存
+   * ------------------------------------------------------------
+   * 为什么前面几版「改判定」都没用：脚本只把监听挂在 document 捕获上。
+   * DOM 捕获顺序是 window → document → html → … → target；B 站播放器为了
+   * 自己做进度 / 亮度 / 音量手势，常在更早加载的脚本里于 document（甚至
+   * window）捕获阶段调用 stopImmediatePropagation()。我们的脚本是
+   * document-idle 才注入、监听后注册 —— 事件根本没到回调，改热区判定
+   * 自然一点用都没有。这也同时解释了「自动播放不解除静音」：那段 unmute
+   * 监听同样挂在 document 上，收不到手势就一直静音。
+   *
+   * 这版三层并存，任何一层活下来都能工作：
+   *   window(capture)   —— 最外层，先于 document，绕开 B 站 document 层拦截
+   *   document(capture) —— 原来的层，兜底
+   *   元素(capture)     —— <video> 与其父级，绕开上层拦截、直达 target
+   * 三层共用单例 session：window 先建会话，document / 元素层再进来时
+   * canStart() 见 session 直接让行；move 用 steps 去重；end 见 session 为空
+   * 直接返回。不会重复写 playbackRate，也不会双份 HUD。
+   * ============================================================ */
+  function touchEv(e, type) {
+    const t = (e.touches && e.touches[0]) || (e.changedTouches && e.changedTouches[0]) || {};
+    return {
+      type: type, kind: 'touch',
+      clientY: t.clientY !== undefined ? t.clientY : (e.clientY || 0),
+      clientX: t.clientX !== undefined ? t.clientX : (e.clientX || 0),
+      target: e.target, pointerId: 'touch', pointerType: 'touch', isPrimary: true, button: 0,
+      touchCount: (e.touches && e.touches.length) || (e.changedTouches && e.changedTouches.length) || 0,
+      composedPath: () => (e.composedPath ? e.composedPath() : [e.target]), _raw: e
+    };
+  }
+  function installTouchLayer(target, label) {
+    if (TOUCH_OFF) return;   // v2.2.0：整套停用，一行监听都不装
+    if (!target || !target.addEventListener || target.__bpeLayer === label) return;
+    target.__bpeLayer = label;
+    const bump = (kind) => {
+      const P = CORE.touchProbe;
+      P[label]++; P.lastLayer = label;
+      if (kind === 'pointerdown') P.pointerdown++;
+      if (kind === 'touchstart') P.touchstart++;
+    };
+    const on = (type, passive, fn) => target.addEventListener(type, e => {
+      bump(type);
+      fn(e, type);
+    }, { capture: true, passive: passive });
+    on('pointerdown', true, e => Touch.start(e));
+    on('pointermove', true, e => Touch.move(e));
+    on('pointerup', true, e => Touch.end(e, false));
+    on('pointercancel', true, e => {
+      const s = Touch.session;
+      if (s && s.touchSeen) return;      // 触屏通道仍在继续，交给 touchend 结算
+      Touch.end(e, true);
+    });
+    on('touchstart', true, e => {
+      const ev = touchEv(e, 'touchstart');
+      const s = Touch.session;
+      if (s) { s.touchSeen = true; s.source = 'touch'; s.startY = ev.clientY; s.startX = ev.clientX; return; }
+      Touch.start(ev);
+    });
+    on('touchmove', false, e => {
+      /* 先让 move() 判定这次是「亮度/音量」还是「倍速滑动」，再决定是否拦滚动；
+         顺序反了会导致第一次滑动（刚判定模式时）没拦住，页面先滚一下。 */
+      Touch.move(touchEv(e, 'touchmove'));
+      const s = Touch.session;
+      if (s && (s.active || s.mode === 'bright' || s.mode === 'volume')) {
+        try { e.preventDefault(); } catch (_) {}
+      }
+    });
+    on('touchend', true, e => Touch.end(touchEv(e, 'touchend'), false));
+    on('touchcancel', true, e => Touch.end(touchEv(e, 'touchcancel'), true));
+    LOG('Touch', '触控层已安装 · ' + label);
+  }
+  // v2.1.6：window 层已由 installEarlyBridge() 在 document-start 抢先注册，
+  // 这里只装 document 层；元素层在 attachVideo() 里绑定。
+  installTouchLayer(document, 'document');
+  window.addEventListener('blur', () => { if (Touch.session) Touch.end(null, true); });
+  Bus.register('touchUnlock', () => Touch.unlock('徽标 / 设置 / 菜单'));
+  Bus.register('brightReset', () => Touch.resetBright());
+  Bus.register('touchDiag', () => {
+    const c = Touch.cfg();
+    const d = Object.assign({}, CORE.touchDiag || { result: '尚未使用触控倍速' }, {
+      checkedAt: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
+      page: location.pathname, fullscreen: !!(document.fullscreenElement || document.webkitFullscreenElement),
+      cfg: c, rateList: CFG.rateList,
+      source: Touch.session ? Touch.session.source : ((CORE.touchDiag && CORE.touchDiag.source) || null),
+      touchSeen: Touch.session ? !!Touch.session.touchSeen : !!(CORE.touchDiag && CORE.touchDiag.touchSeen),
+      mode: Touch.session ? Touch.session.mode : ((CORE.touchDiag && CORE.touchDiag.mode) || null),
+      lockedRate: Number(CFG.touchLockRate) || 0,
+      bright: CORE.bright.value, volumeSettable: volumeIsSettable(),
+      biliFullscreen: WebFull.isOn(),
+      webFullBtn: !!WebFull.btn(),
+      videoRect: (() => { try { const v = curVideo || findVideo(); const r = v && v.getBoundingClientRect();
+        return r ? { w: Math.round(r.width), h: Math.round(r.height), t: Math.round(r.top), l: Math.round(r.left) } : null; } catch (e) { return null; } })(),
+      sysFullBlocked: CORE.sysFullBlocked,
+      fullscreenSystem: !!(document.fullscreenElement || document.webkitFullscreenElement),
+      /* v2.1.5：事件到达探针，定位「事件有没有进来 / 从哪层进来 / 被谁拒了」 */
+      probe: Object.assign({}, CORE.touchProbe),
+      unmuteProbe: Object.assign({}, CORE.unmuteProbe),
+      dmClip: (() => { const x = Object.assign({}, CORE.dmClip); delete x.appliedEls; return x; })(),
+      gestureState: CORE.dmClip.state, gestureTiles: CORE.dmClip.tiles,
+      gestureTouchSeen: CORE.dmClip.touchSeen, rateWritable: CORE.dmClip.rateWritable,
+      dmAreaSource: CORE.dmClip.source,
+      tapPassthrough: !!CFG.tapPassthrough, tapForwarded: CORE.dmClip.tapForwarded,
+      dblForwarded: CORE.dmClip.dblForwarded, tapSwallowed: CORE.dmClip.tapSwallowed,
+      lastTapReason: CORE.dmClip.lastTapReason,
+      early: window.__BPE_EARLY__ ? Object.assign({}, window.__BPE_EARLY__) : null,
+      earlyRegistered: !!CORE.earlyRegistered, bootReadyState: CORE.bootReadyState,
+      earlyUnmute: Object.assign({}, CORE.earlyUnmute),
+      autoUnmute: !!CFG.autoUnmute, autoPlay: !!CFG.autoPlay,
+      userMuted: !!CORE.userMuted, gestureSeen: !!CORE.gestureSeen,
+      videoMuted: (() => { try { const v = curVideo || findVideo(); return v ? !!v.muted : null; } catch (e) { return null; } })(),
+      currentRate: (curVideo || findVideo()) ? (curVideo || findVideo()).playbackRate : null,
+      rememberedRate: CFG.rate,
+      session: Touch.session ? { active: Touch.session.active, moved: Touch.session.moved,
+        locked: Touch.session.locked, steps: Touch.session.steps, target: Touch.session.target,
+        baseRate: Touch.session.baseRate, source: Touch.session.source,
+        touchSeen: Touch.session.touchSeen } : null,
+      core: CORE.touchRate
+    });
+    copyText(JSON.stringify(d, null, 2));
+    toast('已复制触控倍速诊断 · 看 session / result / cfg');
     render();
   });
 
@@ -1757,7 +3970,13 @@
     const v = findVideo();
     if (!v) return toast('⌛ 还没找到 <video>');
     if (CORE.userMuted) return toast('你主动静音过，脚本让位 · 按 M 或点 B 站音量按钮恢复');
-    toast(unmuteNow(v, '手动命令') ? '🔊 已解除静音（记忆音量已应用）' : '当前未静音，无需操作');
+    CORE.lastGestureAt = Date.now();      // 命令本身就是一次用户交互
+    const ok = unmuteNow(v, '手动命令 · 设置 / 菜单');
+    const U = CORE.unmuteProbe;
+    U.events++; U.attempts++; U.lastLayer = '命令';
+    U.lastReason = ok ? '手动命令已解除' : '手动命令未解除（已非静音 / 自动解除已关）';
+    U.stillMuted = !!v.muted;
+    toast(ok ? '🔊 已解除静音（记忆音量已应用）' : (v.muted ? '仍为静音：请确认「自动解除静音」已开启' : '当前未静音，无需操作'));
   });
 
   /* ============================================================
@@ -3122,9 +5341,14 @@
             '<button class="bpe-x" data-act="close">✕</button>' +
           '</div>' +
           '<div class="bpe-body"><nav class="bpe-nav"></nav><main class="bpe-content"></main></div>' +
-          '<div class="bpe-foot">v2.0.5 · BilibiliPlus Xi/Elio · by Xi/Elio X. Blaze · 已移除防跳转 / 去 App 横幅</div>' +
+          '<div class="bpe-foot">v2.3.5 · BilibiliPlus Xi/Elio · by Xi/Elio X. Blaze · 极简竖条 HUD</div>' +
         '</div>' +
         '<div class="bpe-toast" hidden></div>' +
+        '<div class="bpe-touch-hud center" hidden><div class="bpe-th-main"></div><div class="bpe-th-sub"></div><div class="bpe-th-bar"><i></i></div></div>' +
+        '<div class="bpe-tv-level bpe-tv-bright"><span class="bpe-tv-emo">☀</span><div class="bpe-tv-track"><i></i></div><span class="bpe-tv-pct">100%</span></div>' +
+        '<div class="bpe-tv-level bpe-tv-vol"><span class="bpe-tv-emo">🔊</span><div class="bpe-tv-track"><i></i></div><span class="bpe-tv-pct">80%</span></div>' +
+        '<div class="bpe-tv-rate"></div>' +
+        '<button class="bpe-rate-lock" data-act="cmd:touchUnlock" hidden></button>' +
         '<div class="bpe-kbdstate" hidden>⌨ 输入中 · 按 Esc 恢复快捷键</div>' +
         '<div class="bpe-search bpe-overlay" hidden>' +
           '<div class="bpe-fs">' +
@@ -3172,11 +5396,10 @@
     refresh: '刷新推荐（点击后验证卡片真的变化）', danmu: '弹幕显示开关（点真实状态载体并验证）',
     searchZoom: '原生搜索框：按一下弹出 / 再按关闭复原', floatSearch: '浮层搜索（原生风格 · 联想词 · 分类结果）',
     triple: '一键三连（官方接口）', capture: '截取当前画面',
-    fullscreen: '全屏 / 退出（转发 B 站按钮）', fillToggle: '填充模式循环切换',
+    fullscreen: '网页全屏 / 退出（转发 B 站按钮，不改 DOM）', fillToggle: '填充模式循环切换',
     fillReset: '复位全屏状态（黑屏自救）',
     mute: '静音切换', rateDown: '降一档倍速（长按相反档键回 1×）',
-    rateUp: '升一档倍速（长按相反档键回 1×）', learn: '一键开启 / 恢复学习模式',
-    nativeFullscreen: '原生播放器全屏（会丢弹幕·默认不绑）'
+    rateUp: '升一档倍速（长按相反档键回 1×）', learn: '一键开启 / 恢复学习模式'
   };
   /* v2.0.0 信息架构：4 页 + 打赏页。
      ⌂ 概览＝状态总览 · ⚙ 功能开关＝所有设置 / 键位 / 档位 / 名单 / 直链
@@ -3201,8 +5424,10 @@
   function tabHome() {
     const conflicts = detectConflicts();
     const tiles = [
-      ['扩展倍速', CFG.rateEnabled ? '0.5× ~ 5× 共 ' + CFG.rateList.length + ' 档 · 速率仲裁' : '已关闭', CFG.rateEnabled],
-      ['全屏智能铺满', '转发 B 站按钮 · 不动 DOM', CFG.fillEnabled],
+      ['扩展倍速', CFG.rateEnabled ? '0.5× ~ 5× 共 ' + CFG.rateList.length + ' 档 · 单帧合并写入' : '已关闭', CFG.rateEnabled],
+      ['触控倍速', CFG.touchRate ? '长按 2× · ' + (Number(CFG.touchLockSec) || 10) + 's 锁定 · 下滑解锁' : '已关闭', CFG.touchRate],
+      ['移动端手势', CFG.touchBrightVolume ? '左半屏亮度 / 右半屏音量' : '已关闭', CFG.touchBrightVolume],
+      ['网页全屏', '转发 B 站按钮 · 不改 DOM 布局', true],
       ['键盘快捷键', '单监听 · S 原生 / Shift+S 浮层 · ' + Object.keys(CFG.shortcuts).length + ' 条命令', true],
       ['分区屏蔽', CFG.learnMode ? (CFG.hidePlaceholder ? '占位置「与学习无关」' : '学习模式开启中') : '一键开启 / 恢复', CFG.learnMode],
       ['UP 主屏蔽', '名单 ' + CFG.blockedUps.length + ' 人', true],
@@ -3272,7 +5497,25 @@
         sw('longPressCancelRate', '长按相反档键取消倍速', '短按仍升/降一档；同向长按保留连续升降') +
         sw('officialHoldToNormal', '官方长按 3× 松开回 1×', '不拦右方向键；松开后不恢复之前档位') +
         num('holdThresholdMs', '长按判定阈值 (ms)', '当前 ' + (Number(CFG.holdThresholdMs) || 340) + ' ms · Safari 不发 repeat 时按时间兜底', 120, 1200, 20) +
-        hint('短按 <code>[</code> / <code>]</code> 升降一档；长按相反档键回 1×；官方长按右方向键 3× 松开也回 1×，不恢复旧档位。') + '</div>' +
+        hint('短按 <code>[</code> / <code>]</code> 升降一档；长按相反档键回 1×；官方长按右方向键 3× 松开也回 1×，不恢复旧档位。所有写入同一帧合并，不再卡一下。') + '</div>' +
+
+      '<div class="bpe-grouptitle">🖐 移动端同款触控（研究版）</div>' +
+      '<div class="bpe-card">' +
+      sw('touchV3', '启用移动端同款触控', '长按 2× / 上滑升档 / 按住锁定 / 下滑松手解锁') +
+      sw('touchBrightVolume', '左亮度 / 右音量手势', '未到长按时长就上下滑：左半屏调画面亮度，右半屏调新音量档位') +
+      sw('touchBlockNative', '屏蔽 B 站原生音量手势', '长按 / 滑动时独占 move，不再和网页原生音量 HUD 叠触发（短按仍完整放行）') +
+      sw('touchReleaseEnd', '松手事件放行给 B 站（防状态机卡死）', '关掉会掐断 pointerup/touchend，B 站会一直以为还在拖：松手后 hover 仍调音量、左右拖变 seek、单击改进度') +
+      num('touchV3HoldMs', '长按判定 (ms)', '当前 ' + (Number(CFG.touchV3HoldMs) || 280) + ' ms · 短按完全放行，B 站原生单击 / 双击照常', 120, 1200, 20) +
+      num('touchV3LockSec', '按住多少秒锁定', '当前 ' + (Number(CFG.touchV3LockSec) || 10) + ' s · 可 3–60 秒自定义', 3, 60, 1) +
+      num('touchV3SlidePx', '滑动多少像素变一档', '当前 ' + (Number(CFG.touchV3SlidePx) || 44) + ' px', 16, 160, 4) +
+      '<div class="bpe-actions">' + btn('cmd:touchV3Diag', '📋 触控诊断') + btn('cmd:touchHudTest', '🔔 测试提示层') + btn('cmd:touchV3Unlock', '🔓 解除锁定') + btn('cmd:brightReset', '☀ 亮度复位') + '</div>' +
+      hint('<b>这版不是复活旧代码</b>，是按 WebKit 功能开关调研重写：监听只绑<b>播放器元素</b>（不绑 window/document 根 —— 根上 touch 监听默认 passive，<code>preventDefault()</code> 会被忽略，这正是前 9 版「上下滑都是音量、长按没反应」的真因）；显式 <code>{passive:false}</code>、第一个 move 就拦、<code>overscroll-behavior:contain</code> + <code>overflow-anchor:none</code> + <code>user-select:none</code> + <code>-webkit-touch-callout:none</code>（对应你截图里已开的三个 CSS 开关）；<b>放行 iPadOS 16.4+ 的 <code>Element.requestFullscreen()</code></b>，元素全屏时 DOM 仍在网页里、触摸可达，只吞把画面交给原生播放器的 <code>webkitEnterFullscreen</code>。倍速每次写入都<b>读回验证</b>、不生效就如实提示并尝试 B 站自己的倍速菜单，绝不假装成功。<b>不建顶层 tiles、不合成 click、短按不拦</b> → 单击显隐工具栏 / 双击暂停完整保留。') +
+      hint('<b>v2.3.5 极简 HUD + 倍速拖动修复</b>：① 亮度/音量改成<b>左右各一条竖细轨</b>（7px 宽、emoji + XX%、低可见度），<b>松手立刻消失</b>；非全屏放画面外，全屏放画面顶端 / 左右边缘。② 长按<b>不再显示</b>「几倍速 + 上下划」大段提示和进度条，只有上滑变档时闪一行「×多少」、下滑时提示「松开锁定倍速 / 松开还原倍速」。③ 修三个拖动 bug：<b>上滑升不了档</b>是旧版拿只到 2× 的 touchV3Rates 算档位而长按已是顶档，改用全局 0.5~5 档位表并按固定基准算（旧版还会连跳档）；<b>一直按着回原速</b>是 ratechange → Rate.correct() 拿键盘留下的旧 intent（常 1×）把触控写的 2× 改回去，现在写入前同步 intent + 让 restoreRate 让位；<b>锁定太灵敏</b>改成必须下滑超过 1/5 画面高度，上滑每档也改成 1/8 画面高度。诊断新增 <code>hudKind / rateText / rateIdx0 / lockDist / stepDist</code>。') +
+      hint('<b>v2.3.4 根因纠正</b>：上一版为了「防 B 站在松手时补算音量」，在 window 捕获层把 <code>pointerup / touchend</code> 也 <code>stopImmediatePropagation()</code> 掐了 —— 但 B 站手势识别器是「down 记起点 → move 累计 → <b>up 结算并清零状态机</b>」，掐掉 up 它就永远收不到「手势结束」，一直 armed。于是<b>松手后上下 hover 继续调音量、左右拖变成 seek、再点一下把积压状态结算成进度跳变 / 音量固定</b>，和你这轮反馈逐字对得上。「防补算」本就是我凭空推测、没有证据，代价却远大于收益。现在 <b>end 完整放行</b>（连 <code>preventDefault</code> 都不调），B 站正常收工；所有 <b>move 仍在 window 层独占掐掉</b>，它手里只有 down 起点 + up 终点，判定未达阈值正常结束。新增「松手事件放行给 B 站」开关（默认开，可回退）和诊断 <code>endReleased / endBlocked / releaseEnd</code>。') +
+      hint('<b>v2.3.3 修两处</b>：① <b>「还是没有任何 UI 提示」</b> 是真 bug —— 提示层 CSS 基础态是 <code>opacity:0</code>，必须加 <code>.on</code> 才可见，v2.3.x 重写 hud() 时漏了这一句，元素一直全透明（模拟验收只读 hidden 没读 CSS，又骗过去了）。现在补 <code>.on</code> + inline 强制可见，并加「🔔 测试提示层」按钮，点一下立刻能确认。② <b>拖出画面外松开后，没点按也能继续调亮度/音量</b>：旧版 end 只绑播放器 root，指针在画面外松开时事件链不经过 root → session 和定时器全没清，成僵尸态。现在加 <b>window 捕获兜底</b>（end / mouseup / blur 全局结算、未按下 hover 立刻收手、画面外 move 也在 window 层独占挡住 B 站），并让新按下先安静清掉旧 session。短按仍完全放行。诊断新增 <code>hud.found / hud.on / hud.opacity / sessionActive / endVia / noButtonMoves / globalGuard</code>。') +
+      hint('<b>v2.3.2 手势独占</b>：滑左侧调亮度时 B 站原生音量手势会叠着触发、长按下滑也被它抢成调音量 —— 因为 <code>preventDefault()</code> 只挡浏览器默认行为，挡不住 B 站自己注册的 touch 手势识别器。现在监听改到<b>捕获阶段</b>，手势激活后 <code>stopImmediatePropagation()</code> 让 B 站收不到这一批 move / end；短按仍完全放行，单击显隐工具栏 / 双击暂停不受影响。<b>提示词按你给的原话</b>：长按显示「上滑调高倍速档位 · 下滑锁定倍速」，锁定后长按显示「下滑解除倍速」；下滑锁定 / 上滑松手锁定 / 纯松手恢复各自独立。亮度与新音量都带 <b>XX% 百分比 + 进度条</b>，音量在 iPad 上若 <code>video.volume</code> 只读会如实标「网页音量档位（系统音量请用侧键）」，不冒充。') +
+      hint('<b>v2.3.1 真机诊断修复</b>：你回传的诊断里 <code>events:82</code> 但 <code>starts:0 / moves:0 / ends:0</code>、<code>lastReject:"控件让行"</code> —— 事件全到了脚本，倍速也确认可写（<code>rateWritable:true</code>、0.5/1/1.5/2 全档通过），CSS 四项全部生效，<b>WebKit 开关一个都不用动</b>。真因是旧 <code>inControl()</code> 用 <code>[class*="ctrl-bottom"]</code> 之类宽通配沿 B 站祖先链误命中，把按在画面正中央的每一次 <code>touchstart</code> 都判成控件直接丢弃。现在只认真正可交互元素本身 + video 矩形底部控制栏几何带，画面中央一律放行；诊断新增 <code>startsRejected / rejectTarget / endsByType</code>。') +
+      hint('<b>真机排查</b>：设置 → Safari → 高级 → WebKit 功能开关，用搜索框分别搜 <code>touch</code> / <code>fullscreen</code> / <code>audio</code> / <code>scroll</code> / <code>select</code> 并截图；改开关后要关标签页重开才生效。「📋 触控诊断」里的 <code>passiveWorks / rateWritable / presentationMode / acceptedRates</code> 是真机证据，复制发我即可精准定位。') + '</div>' +
 
       '<div class="bpe-grouptitle">⛶ 全屏</div>' +
       '<div class="bpe-card">' +
@@ -3283,8 +5526,8 @@
           '<option value="contain"' + (CFG.fillMode === 'contain' ? ' selected' : '') + '>适应（带黑边）</option>' +
         '</select></div>' +
         sw('fillEnabled', '启用铺满增强', '关掉后 F 仍然只是普通地切换 B 站全屏，不会黑屏') +
-        '<div class="bpe-actions">' + btn('cmd:fullscreen', '⛶ F 切换全屏', 'primary') + btn('cmd:fillToggle', '⇄ 换模式') + btn('cmd:fillReset', '🧹 复位') + '</div>' +
-        hint('F 只是转发 B 站自己的全屏按钮，弹幕与控制栏全程保留。Safari 地址栏与手势条是系统外壳，网页脚本隐藏不了。') + '</div>' +
+        '<div class="bpe-actions">' + btn('cmd:fullscreen', '⛶ F 网页全屏 / 退出', 'primary') + btn('cmd:fillToggle', '⇄ 换模式') + btn('cmd:fillReset', '🧹 复位') + '</div>' +
+        hint('<b>v2.1.4 修复「画面没了 / 超出屏幕」</b>：上一版给播放器容器强加 <code>position:fixed + 100vw/100vh + !important</code>，把 B 站内部 flex 与弹幕层定位撑坏了。这版<b>一个布局属性都不碰</b>：F 只点 B 站自己的「网页全屏」按钮，画面、弹幕、控制栏全由 B 站自己排；铺满只用 <code>&lt;video&gt;</code> 的 <code>object-fit</code> 轻微裁切。系统全屏 / 原生视频全屏仍全部禁用并精确改道，所以不会再出现「向下轻扫退出」。触控热区改为按 <code>&lt;video&gt;</code> 在屏幕上的几何位置判定，普通观看、宽屏、网页全屏都生效。') + '</div>' +
 
       '<div class="bpe-grouptitle">🎬 自动播放与音量</div>' +
       '<div class="bpe-card">' +
@@ -3293,7 +5536,7 @@
         sw('autoUnmute', '自动解除静音', '只在真实手势回调里同步执行，不碰播放状态') +
         num('preferredVolume', '记忆音量 (0–1)', '当前 ' + Math.round(CFG.preferredVolume * 100) + '% · volume 可写=' + (volumeIsSettable() ? '是' : '否（iPad）'), 0, 1, 0.05) +
         '<div class="bpe-actions">' + btn('cmd:autoPlayNow', '🎬 立即尝试起播') + btn('cmd:unmuteNow', '🔊 解除静音') + btn('cmd:mute', 'M 静音切换') + '</div>' +
-        hint('带声音优先起播、被拒回退静音；画面跑起来后立即收手，之后暂停一次就停住。iPad 系统音量网页无权读写，记忆的是你最后一次调整的意图值。') + '</div>' +
+        hint('带声音优先起播、被拒回退静音；画面跑起来后立即收手，之后暂停一次就停住。<b>v2.1.6：不再预判手势</b>，直接试带声音起播；万一走静音回退，也会在 <code>play()</code> 成功后立刻再试一次零点击解除静音，被 Safari 回退就静音续播、画面不中断 —— 目标是一进播放页就有声音。<b>v2.1.5</b> 的手势监听（window 层 + touchstart / pointerdown）仍保留作兜底。若仍一直静音，先按「🔊 解除静音」，再复制「📋 触控诊断」看 <code>earlyUnmute</code> / <code>unmuteProbe</code>。iPad 系统音量网页无权读写，记忆的是你最后一次调整的意图值。') + '</div>' +
 
       '<div class="bpe-grouptitle">🔍 搜索</div>' +
       '<div class="bpe-card">' +
@@ -3368,9 +5611,10 @@
       '<div class="bpe-card"><div class="bpe-actions">' +
         btn('cmd:autoPlayDiag', '📋 起播诊断') + btn('cmd:volumeDiag', '📋 音量诊断') + btn('cmd:rateDiag', '📋 倍速诊断') +
         btn('cmd:searchDiag', '📋 原生诊断') + btn('cmd:floatDiag', '📋 浮层诊断') + btn('cmd:refreshDiag', '📋 刷新诊断') +
-        btn('cmd:danmuDiag', '📋 开关诊断') + btn('cmd:searchRetry', '🔄 重试唤出') +
+        btn('cmd:danmuDiag', '📋 开关诊断') + btn('cmd:touchV3Diag', '📋 触控诊断') + btn('cmd:searchRetry', '🔄 重试唤出') +
         btn('cmd:autoPlayNow', '🎬 立即尝试起播') + btn('cmd:unmuteNow', '🔊 解除静音') + btn('cmd:rateNormal', '↩︎ 回 1×') +
         '</div>' +
+        '<div class="bpe-hint">v2.3.0 起触控按调研重写并装回；「📋 触控诊断」的 <code>passiveWorks</code>（preventDefault 是否真生效）、<code>rateWritable</code>（playbackRate 写入是否被 iPadOS 接受）、<code>presentationMode</code>（是否进了原生播放器全屏）、<code>acceptedRates</code>（实测可写档位）是真机可核实的证据。WebKit 功能开关页搜 <code>touch / fullscreen / audio / scroll / select</code> 逐项截图，配合诊断一起看。</div>' +
         '<span class="bpe-code">' + esc(JSON.stringify({ autoPlay: CORE.apDiag || null, switchDiag: CORE.switchDiag || null })) + '</span>' +
         '<div class="bpe-hint">起播 <code>err=NotAllowedError</code> 表示 Safari 要求手势；刷新 <code>已点击但列表未变</code> 可复制命中按钮定位；音量 <code>volumeSettable=false</code> 在 iPad 是正常现象；浮层 <code>suggestChannel=不可用</code> 是联想接口跨域被拦，搜索与分类照常可用。</div></div>' +
       '<div class="bpe-grouptitle">🩺 Stay 能力探测</div>' +
@@ -3419,7 +5663,55 @@
    * ============================================================ */
   function logSections() {
     return [
-      { t: 'v2.0.5 · 彻底移除防跳转 / 去 App 横幅（当前）', open: true, h:
+      { t: 'v2.3.5 · 极简竖条 HUD / 修倍速拖动三处（当前）', open: true, h:
+        '<div class="bpe-card"><h3>UI 按你要求重做，三个拖动 bug 都查到代码级原因</h3><p><b>① 极简 HUD</b>：亮度 / 音量各一条<b>竖细轨</b>（宽 7px）+ emoji（☀ / 🔊）+ XX%，无底框无副标题，<code>opacity:.52</code>；<b>松手或松鼠标立刻消失</b>（直接关 display，不再等 1.6s 淡出）。非全屏按 <code>video.getBoundingClientRect()</code> 把竖条放<b>画面矩形外侧</b>、倍速提示放画面上方外侧；全屏则竖条贴屏幕左右边缘、倍速放<b>画面顶端</b>。<br><br><b>② 长按提示精简</b>：长按本身<b>不显示任何东西</b>（去掉「⚡ 2× 临时倍速 + 上滑调高…」大段文字和进度条）；上滑每变一个档位只闪一行「<code>2.5×</code>」，下滑后提示「<b>松开锁定倍速</b>」/「<b>松开还原倍速</b>」，都是低可见度纯文字。<br><br><b>③ 上滑无法升高档位</b>：旧版用 <code>C.rates</code>（<code>touchV3Rates=[0.5,1,1.5,2]</code>）算档位，而长按目标已是 <b>2× = 该表最后一档</b>，<code>indexOf(2)+steps</code> 永远被 clamp 回 2× —— 一档都升不了。改用全局 <code>CFG.rateList</code>（0.5~5 共 11 档），并记<b>固定基准 <code>rateIdx0</code></b>；旧版拿「会变的 <code>s.rate</code>」做 indexOf 基准，steps=2 时会连跳两档，也一并修掉。<br><br><b>④ 一直按着还会回到原速</b>：<code>TouchV3.writeRate()</code> 同步写 <code>v.playbackRate</code> 会触发 <code>ratechange → Rate.correct()</code>，而 <code>Rate.intent</code> 是上一次<b>键盘倍速</b>留下的旧档位（常为 1×）；correct() 见 2× ≠ 1× 就在 setTimeout 里改回 1×。v2.1.2 还删了 correct() 里的触控让位判断，更没东西挡。现在写入前把 <code>Rate.intent</code> 同步成触控目标、清 <code>Rate.pending</code>，并给 <code>CORE.touchRate.active</code> 打标记让 <code>restoreRate()</code>（playing / loadedmetadata 等 6 个事件）在触控期间让位，松手时撤销。<br><br><b>⑤ 锁定检测太灵敏</b>：下滑锁定 / 解除阈值从固定 44px 改为<b>画面高度 1/5</b>（≈117px），上滑每档步进改为<b>画面高度 1/8</b>（≈73px），都按 video 矩形实时算，不再一抖就触发。<br><br><b>一行没动</b>：v2.3.4 松手事件放行（B 站状态机不卡死）、v2.3.3 HUD <code>.on</code> 可见性与 🔔 测试提示层、window 兜底收手、v2.3.2 下滑锁定 / 解除语义与百分比数值、capture+passive:false、短按完全放行，以及搜索 / 三连 / D 开关 / 自动起播出声 / 音量记忆 / 键盘倍速 / F 网页全屏 / 专注屏蔽 / R 刷新 / 5 页签含打赏。</p></div>' +
+        '' },
+      { t: 'v2.3.4 · 放行松手事件，B 站状态机不再卡死', open: false, h:
+        '<div class="bpe-card"><h3>不是没堵上，是堵错了地方：我把「结束信号」也堵掉了</h3><p>你这轮四句连起来其实是<b>一个状态机卡死</b>：松开后上下 hover 触发原生音量、左右拖滑动进度条、点按一下进度就变、音量还固定住。<br><br>根因在 v2.3.2 起的一行「防补算」代码：为了怕 B 站在 <code>touchend</code> 里按「起点→终点」补算音量，我在 window 捕获层对 <code>pointerup / touchend</code> 也调了 <code>stopImmediatePropagation()</code>。但 B 站播放器的手势识别器是 <code>down(记起点) → move(累计) → up(结算并清零状态机)</code>。<b>掐掉 up，它永远收不到「手势结束」，状态机一直 armed</b>：之后任何 hover move 都被它继续算成音量增量或水平 seek；再点一下画面，积压状态一次性结算，于是进度跳变、音量固定。v2.3.3 的 window 兜底把掐的层级提到最前，反而让 B 站连 document 层的 up 都收不到，卡得更彻底 —— 所以「不仅…甚至…」是恶化，不是没修。<br><br>而「防补算」从头到尾是我<b>凭空推测、没有任何证据</b>，代价远大于收益。<b>这版删掉它</b>：end 完整放行（不 <code>preventDefault</code>、不 <code>stop</code>），B 站收到 up 正常结束状态机；所有 <b>move 仍由 window 层独占掐掉</b>，B 站一个 move 都收不到，手里只有 down 起点 + up 终点，判定「未达阈值」正常收工，不会补算也不会卡住。未按下 hover 也改成只清 session、不拦事件（同样避免掐出不一致状态）。<br><br><b>新增</b>「松手事件放行给 B 站（防状态机卡死）」开关（默认开，万一个别版本真在 end 补算可关回旧行为）与诊断 <code>releaseEnd / endReleased / endBlocked</code>。<b>一行没动</b>：HUD <code>.on</code> 可见性、🔔 测试提示层、window 兜底收手、v2.3.2 下滑锁定 / 解除语义、亮度与音量 XX% HUD、capture+passive:false、短按完全放行，以及搜索 / 三连 / D 开关 / 自动起播出声 / 音量记忆 / 键盘倍速 / F 网页全屏 / 专注屏蔽 / R 刷新 / 5 页签含打赏。</p></div>' +
+        '' },
+      { t: 'v2.3.3 · HUD 终于可见 / 松手立刻收手', open: false, h:
+        '<div class="bpe-card"><h3>两个都是确凿 bug，而且第二个是我模拟验收又漏了</h3><p><b>① 「还是没有任何 UI 提示」</b>：提示层 <code>.bpe-touch-hud</code> 的 CSS 基础态写着 <code>opacity:0</code>，只有 <code>.bpe-touch-hud.on</code> 才是 <code>opacity:1</code>。旧架构 <code>showHud()</code> 里有一句 <code>raf(()=&gt;h.classList.add(&quot;on&quot;))</code>，v2.3.x 重写成 <code>TouchV3.hud()</code> 时<b>把这一句漏了</b> —— <code>h.hidden=false</code> 执行了，元素却一直全透明，真机上就是「长按、滑动一点提示都没有」。之前每版「验证全过」的模拟里，我把 <code>hidden</code> 当成可见性读，压根没解析 shadow 内的 CSS，所以这个 bug 从头到尾没被测出来。现在补 <code>.on</code> + inline <code>opacity:1 / display:block</code>，淡出时移除；另加「🔔 测试提示层」按钮和诊断字段 <code>hud.found / on / opacity / display</code>，能不能看见不再靠猜。<br><br><b>② 「拖出画面范围再松开，拖回来没点按上下滑还会调亮度/音量，得再点一下画面才结束」</b>：end 事件（<code>touchend / pointerup</code>）只绑在播放器 root。指针拖出画面外松开时，事件 target 不在 root 子树，捕获/冒泡链<b>根本不经过 root</b> → <code>session</code> 没清、<code>holdTimer / lockTimer</code> 没 clear → 僵尸 session。于是之后任何 hover <code>pointermove</code> 都被当成同一次手势继续算亮度/音量；画面外那些 move 又被 B 站 document 层的手势监听接走，原生音量条跟着冒出来；直到再点一下画面产生新的 down+up，才把旧 session 结算掉 —— 和你描述逐字对得上。<b>修法</b>：新增 <b>window 捕获兜底层</b>（比 document 捕获更早）：全局接 <code>end / mouseup / blur</code> 结算、检测「没按下的 move」立刻收手并独占一次、画面外的激活态 move 也在 window 层交给 <code>on()</code> 掐断 B 站；新按下时先安静清掉僵尸 session（<code>quiet</code> 模式不拦这次 pointerdown，原生 click 不受影响）；<code>on()</code> 加同事件对象去重，防 window 层与 root 层双算。<b>短按、单击显隐工具栏、双击暂停仍完全放行。</b><br><br><b>一行没动</b>：v2.3.2 的下滑锁定 / 解除语义、提示词文案、亮度与新音量百分比 HUD、capture+passive:false、倍速读回验证、放行 Element.requestFullscreen，以及搜索 / 三连 / D 开关 / 自动起播出声 / 音量记忆 / 键盘倍速 / F 网页全屏 / 专注屏蔽 / R 刷新 / 5 页签含打赏。</p></div>' +
+        '' },
+      { t: 'v2.3.2 · 掐掉原生音量手势 / 下滑锁定 / 百分比 HUD', open: false, h:
+        '<div class="bpe-card"><h3>你报的三件事，其实是同一根藤</h3><p><b>① 滑左侧连音量一起调、长按下滑变成调音量</b>：v2.3.1 只在 <code>touchmove</code> 里 <code>preventDefault()</code>，它只能拦浏览器默认滚动，<b>拦不住 B 站播放器自己注册的 touch 手势识别器</b> —— 两者同时收到同一批 move，于是我们的亮度/倍速和它的音量 HUD 叠着跑。现在监听从冒泡改到<b>捕获阶段</b>，且手势激活后调 <code>stopImmediatePropagation()</code>，让 B 站收不到这批 move / end；<code>touchend</code> 也独占一次，防它按「起点→终点」补算音量。<b>短按完全不拦</b>，B 站原生单击显隐工具栏 / 双击暂停照常。设置页有「屏蔽 B 站原生音量手势」开关，可随时关。<br><br><b>② 长按下滑无法锁定</b>：旧版 rate 分支把下滑算成「降档」，<code>isEnd</code> 又一律按下滑判成「解锁」，语义打架。现在按你给的定义重排：<b>未锁定长按</b> → 上滑调高倍速档位、<b>下滑锁定倍速</b>（不降档）；<b>已锁定后再长按</b> → 临时回 1×、<b>下滑解除倍速</b>；上滑松手锁定当前档；纯松手恢复长按前状态。按住 10s 自动锁定保留。<br><br><b>③ 提示词 + 百分比</b>：未锁定长按显示「上滑调高倍速档位 · 下滑锁定倍速」，锁定后长按显示「下滑解除倍速」，下滑锁定 / 解除各有独立确认 HUD。亮度显示 <code>☀ 亮度 XX%</code>、新音量显示 <code>🔊 音量 XX%</code>，都带进度条；右半屏上下滑调的是「新音量档位」，能写 <code>video.volume</code> 就真写并回读，iPad 只读时副标题明确写「网页音量档位（系统音量请用侧键 / 控制中心）」，不冒充系统音量。<br><br><b>诊断新增</b> <code>nativeBlocked / volumeWritable / brightPct / volumePct / lastHud / blockNative</code>。<b>一行没动</b>：短按放行、绑播放器元素 + <code>passive:false</code>、倍速读回验证、放行 Element.requestFullscreen、搜索、三连、D 开关、自动起播出声、音量记忆、键盘倍速、F 网页全屏铺满、专注屏蔽、R 刷新、5 页签含打赏。</p></div>' +
+        '' },
+      { t: 'v2.3.1 · 真机诊断定位到「控件让行」误杀', open: false, h:
+        '<div class="bpe-card"><h3>这次不是猜，是你回传的 JSON 一行定位</h3><p>诊断：<code>events: 82</code>、<code>starts: 0 / moves: 0 / ends: 0</code>、<code>lastReject: "控件让行"</code> —— <b>82 个触摸事件全都到了 TouchV3.on()，但每一次 touchstart 都被 inControl() 判成控件直接 return，session 根本没建立</b>，后面的 move / end 全部空转，所以长按、上滑、亮度、音量一个都不出来。同一份诊断还一次性证伪了我之前三个挡箭牌：<code>computed.touchAction = none</code> / <code>overscrollBehavior = contain</code> / <code>userSelect = none</code> 全部生效；<code>rateWritable = true</code> 且 <code>acceptedRates = [0.5, 1, 1.5, 2]</code> 全档可写（Apple 文档那句「iOS 不可设置 playbackRate」不能当成你这台 iPad 的结论）；<code>presentationMode = "inline"</code>、<code>elementFullscreenAPI = true</code>，DOM 在、没进原生播放器。<b>所以你那 200 个 WebKit 开关一个都不用手动改。</b><br><br><b>根因</b>：旧 <code>inControl()</code> 写了 <code>[class*="ctrl-bottom"] / [class*="progress-wrap"] / [class*="sendbar"] / [class*="inputbar"] / [class*="dm-input"]</code> 这类宽通配，用 <code>el.closest()</code> 沿 B 站播放器祖先链一路向上找，命中了布局容器 —— 手指按在画面正中央也被判成「控件让行」。这正是前 9 版反复出现的「宽通配误伤」同一个毛病，只是这次藏在新架构里。<br><br><b>这版只改这一处</b>：① 去掉全部 <code>[class*=]</code> 通配，只认 <code>button/a/input/textarea/select/[contenteditable]/[role=button]/[data-bpe]</code> 这些真正可交互元素本身；② 控件区改成<b>几何判定</b>，只排除 video 矩形底部那条控制栏（高度取 min(76px, 16%)）；③ 画面中央一律放行。短按依旧不 <code>preventDefault</code>、不合成 click → B 站原生单击显隐工具栏 / 双击暂停完整保留。<br><br><b>顺手修两处</b>：诊断里 <code>cfg.bright = false</code> 是 v2.2.0 写盘污染、且设置页当时没有开关入口，这版迁移强制恢复并在「🖐 移动端同款触控」加了独立开关；诊断新增 <code>startsRejected / rejectTarget / rejectCount / endsByType / brightEnabled</code>，下次再异常能直接看到是哪个元素被拒。另修一处真 bug：亮度/音量手势首次判定成立时把 <code>lastY</code> 记成了「当前 move 的 y」，导致第一下滑动位移被吃掉、值永远停在 1（看起来像滑了没反应）；现改为取 touchstart 的 y 作基线。<br><br><b>一行没动</b>：绑定元素 / <code>passive:false</code> / 第一个 move 就拦 / 放行 Element.requestFullscreen / 倍速读回验证 / 短按放行 / 搜索、三连、D 开关、自动起播出声、音量记忆、键盘倍速、F 网页全屏铺满、专注屏蔽、R 刷新、5 页签含打赏。</p></div>' +
+        '' },
+      { t: 'v2.3.0 · 移动端同款触控（研究版）', open: false, h:
+        '<div class="bpe-card"><h3>研究查出的两条真因：不是平台做不到，是我把路自己堵了</h3><p><b>① 监听层级完全反了。</b>WebKit 官方（Safari 14.1 发布说明）明确写：<i>「注册在 window / document / body 根上的 wheel / touch 监听默认按 passive 处理；页面要阻止默认行为，必须在序列的<b>第一个</b> move 事件里调 <code>preventDefault()</code>」</i>。而 v2.1.5–v2.1.8 我为了绕开 B 站的 <code>stopImmediatePropagation</code>，把监听一路从 document 提到 window 捕获层 —— 越提越收不到、<code>preventDefault()</code> 全被忽略，纵向滑动被判成页面滚动直接 <code>pointercancel</code>。这就是你看到的「左右上下滑都是音量（B 站自己的 H5 手势）、长按没反应」。<br>⇒ 这版<b>只绑播放器元素</b>（绝不退化到 document/body），显式 <code>{passive:false}</code>，第一个 move 就拦；配合 <code>overscroll-behavior:contain</code> / <code>overflow-anchor:none</code> / <code>user-select:none</code> / <code>-webkit-touch-callout:none</code>，正好对应你截图里已开的 CSS Overscroll Behavior、CSS Scroll Anchoring、CSS Unprefixed User Select 三个开关。<br><br><b>② 把 iPad 唯一可用的全屏路径一起吞了。</b>WebKit Bugzilla 328773 与 MDN 兼容表写明：<b>iPadOS 16.4+ 支持 <code>Element.requestFullscreen()</code></b>（iPhone 不支持），元素全屏时网页 DOM 仍在、触摸事件照常进页面 JS；只有 <code>HTMLVideoElement.webkitEnterFullscreen()</code> 才把画面交给原生播放器、网页收不到触摸。v2.1.3 我把三个 API 一起吞，等于自断经脉。⇒ 这版<b>只吞 <code>webkitEnterFullscreen</code></b>，放行元素全屏，并在 <code>fullscreenchange</code> 里不再自动 exit。<br><br><b>③ 不再拿模拟测试当交付依据。</b>前 9 版每版都说「50+ 项冒烟全过」，那是 Node 里伪造 DOM / MouseEvent / touch 事件跑的，不是 iPad Safari。这版所有关键结论都写进「📋 触控诊断」由真机自己产出：<code>passiveWorks</code>、<code>rateWritable</code>、<code>acceptedRates</code>、<code>presentationMode</code>、<code>computed.touchAction</code>。<b>倍速每次写入后读回验证</b>，不生效就如实提示并尝试 B 站自己的倍速菜单（Apple 官方写 iOS 上 playbackRate 不可设置，社区又有「仅 0.5/1/1.5/2 离散值」的实测，口径冲突，所以只认真机读回结果）。<br><br><b>④ 原生交互完整保留。</b>不建顶层 tiles、不合成 click / dblclick、短按完全不 preventDefault —— v2.2.0 恢复的单击显隐工具栏、双击播放暂停一个不动。<br><br><b>没动</b>：S 原生 / Shift+S 浮层搜索与联想分类、零导航、三连、D 开关、发弹幕交还官方、自动播放与解除静音、音量记忆、键盘倍速与官方 3×、F 转发网页全屏、专注屏蔽、R 刷新、5 页签含打赏、v2.0.5 删除防跳转的结论。</p></div>' +
+        '' },
+      { t: 'v2.2.0 · 触控层整套停用，还原 B 站原生', open: false, h:
+        '<div class="bpe-card"><h3>不再修第 10 版手势 —— 这版是撤，不是修</h3><p>从 v2.1.0 到 v2.1.8，连续 9 版做「iPad Safari 网页版 B 站触控手势」：三层捕获、document-start 前置桥、裁弹幕蒙版、独占顶层 tiles、短按合成 click …… 真机结果一路是<b>长按无反馈、滑动无反馈</b>，最后连<b>单击唤不出工具栏、双击暂停不了</b>都没了。最根本的错误不是某一行代码，是<b>每一版都用 Node + 伪造 DOM / MouseEvent / touch 事件跑「50+ 项冒烟全过」当交付依据</b> —— 那不是 iPad Safari，也不是 Stay 的注入世界，模拟通过说明不了真机能用。拿它一遍遍说「已修复」，是在浪费你的时间。<br><br><b>这版做什么：</b>把手势整套撤掉，一行都不再拦触摸。<br>① 不注册 window 触控前置桥（只留 passive 的 gesture 通道给自动解除静音）<br>② 不装 document / <code>&lt;video&gt;</code> 元素层触控监听，不给 video 父级加 <code>touch-action:none</code><br>③ 不生成任何顶层 host / tiles，不吞、不合成任何 <code>click / dblclick</code>，不裁弹幕层<br>④ 旧配置里所有触控键强制关，并清掉残留 class<br>⇒ <b>B 站原生单击显隐工具栏 / 双击播放暂停 / 控制栏 / 系统全屏 / 官方 H5 手势，全部恢复成没装脚本时的样子。</b><br><br><b>一行没动</b>：S 原生搜索 / Shift+S 浮层联想与分类结果、零导航、三连（无币补赞藏）、D 弹幕显示开关、发弹幕交还官方、一进播放页自动播放与解除静音、音量调整即记忆、倍速键盘快捷键与官方 3× 松开回 1×、F 转发 B 站网页全屏按钮与画面铺满、专注屏蔽占位文字、R 刷新核对卡片、无水印直链与截帧、5 页签含打赏、v2.0.5 删除防跳转的结论。<br><br><b>关于手势，如实说</b>：在 iPad Safari + Stay 用户脚本这一层，我交付不了可靠的触控手势。调研也没找到公开可核实的 iPad Safari www.bilibili.com 全屏触控成功案例；Apple 官方还写着 iOS 上 <code>playbackRate</code> 可能不可写，系统全屏播放层的触摸更不进网页 JS。要触控手势，得换层（真机调试 / Safari Web Extension / 直接用 B 站 App），不是在用户脚本里再加一层拦截。</p></div>' +
+        '' },
+      { t: 'v2.1.8 · 短按交还 B 站', open: false, h:
+        '<div class="bpe-card"><h3>「连原版点击和双击都没了」—— 独占层把 target 也吃了</h3><p>你反馈：v2.1.7 之后不仅没有滑动 / 长按手势，<b>单击唤不出工具栏、双击暂停不了</b>。根因不在事件被拦，而在 <b>hit-test target</b>：tiles 是 <code>pointer-events:auto</code> 的独立顶层元素，短按虽然既没 <code>preventDefault</code> 也没 <code>stopPropagation</code>，但浏览器派发的兼容 click 只沿 <code>tile → host → body → document</code> 冒泡，<b>永远到不了 B 站自己那层视频容器</b>。B 站的「单击显隐工具栏 / 双击播放暂停」正是绑在那层上，于是全哑了。开源先例（BiliTouch / 触摸屏视频优化）把监听直接绑 B 站容器，所以从没有这个问题；我们为了绕开 B 站 <code>stopImmediatePropagation</code> 自建顶层，就得自己把短按还回去。<br><br><b>修法（只动「未成手势」的那一次）：</b><br>① 判定完全独立于 Touch 状态机：<b>位移 &lt;12px 且时长短于长按阈值余量</b>才算短按。长按（静止超时）、上滑 / 下滑、左亮度右音量都会置 <code>gestured</code>，不转发 —— 不会出现「长按完又暂停一下」。<br>② <code>under(x,y)</code> 用 <code>document.elementsFromPoint</code> 跳过手势层节点取下层 B 站元素；老 WebKit 没有该 API 时临时把 tiles 的 <code>pointer-events</code> 关掉再 <code>elementFromPoint</code>，取完还原，<b>一个布局属性都不碰</b>。<br>③ 合成 <code>click</code> 到该元素；320ms 内、两点距离 &lt;30px 的第二次再补发 <code>dblclick</code> —— 对应 B 站单击显隐工具栏 / 双击暂停。<br>④ tile 自己产生的兼容 <code>click / dblclick</code> 在捕获阶段吞掉（记 <code>tapSwallowed</code>），避免 B 站若在 document 上有委托时被双触发；合成那一发不受影响，因为它走的是下层元素的冒泡路径。<br>⑤ 只吞「紧跟同一次 touchend 的那个 pointerup」，不跨独立短按 —— 初版用 120ms 全局窗口会把快速双击也吞掉，已修正。<br>⑥ 新增开关「<b>短按交还 B 站（单击工具栏 / 双击暂停）</b>」默认开，旧配置自动补；Stay 菜单也加了一键开关。诊断新增 <code>tapDiag.forwarded / dblForwarded / lastTarget / lastReason</code>，实机一眼看清透传有没有发生。<br><br><b>最快自救</b>：⚙ 功能开关 → 🖐 独占顶层手势区 → 关掉「铺满画面、只让控件的手势层」，B 站原生单击 / 双击 / 工具栏<b>立即全部恢复</b>（v2.1.7 之前的行为），再按需打开。<br><br><b>没动</b>：tiles 扫描线挖洞、控件统一让行、屏占比联动 B 站设置、document-start 前置桥 + 三层兜底、零点击解除静音、F 只转发 B 站网页全屏按钮、单帧写入仲裁、自动起播收手、搜索零导航、三连、D 开关、R 刷新、5 页签打赏页、v2.0.5 删除结论。</p></div>' +
+        '' },
+      { t: 'v2.1.7 · 独占顶层手势区', open: false, h:
+        '<div class="bpe-card"><h3>按你的方案：最顶层建一个监听区，铺满显示区域，只让控件，避让面积联动 B 站设置</h3><p>上一版按「裁掉一部分弹幕遮罩」做，但调研把这条路否了：<code>clip-path</code> 只裁可见区域，规范没有授权它改变整棵子树的事件 target；<code>pointer-events:none</code> 也只让该元素退出 hit-test，其 <code>pointer-events:auto</code> 的后代仍会抢 target。开源先例（BiliTouch、触摸屏视频优化、HTML5 视频手势、bilibili-touch-optimizer）做法都一致 —— <b>不猜站点内部层，而是自己建一个稳定的手势根</b>，给它 <code>touch-action:none</code>，自建 HUD 设 <code>pointer-events:none</code>，手势激活后主动 <code>preventDefault + stopPropagation</code> 掐在站点原生手势前面。<br><br><b>这版落地：</b><br>① <b>独占顶层手势区</b>：host 挂 <code>document.body</code>，<code>position:fixed</code> 精确跟随 <code>&lt;video&gt;</code> 的视口矩形（刚好覆盖显示区域；B 站网页全屏时 video 铺满 = 整屏），z-index 高于 B 站所有层。<b>不碰 B 站任何 DOM 属性</b> —— 守住 v2.1.4「动布局就把画面撑坏」的教训。<br>② <b>只让控件</b>：host 本身 <code>pointer-events:none</code>，真正收事件的是由「画面矩形 减去 控件矩形」扫描线分解出来的 <b>tiles</b>。控制栏 / 弹幕输入框 / 进度条上方没有 tile，hit-test 自然落到 B 站控件；读不到控制栏时按已知布局留底部安全条。弹幕显示区照常收手势，透明层不影响弹幕文字显示。<br>③ <b>避让面积不单独设置</b>：删掉上一版那排 25%/50%/75%/全屏 chips，改为自动读 B 站播放器配置里的「弹幕显示区域」（localStorage JSON / 设置面板文案），写进 <code>--bpe-dm-keep</code>，只用来把提示胶囊放到弹幕区下方；读不到就内置回退 1/4 屏，诊断里标 <code>source</code>，绝不编造。<br>④ <b>事件转发给原状态机</b>：长按 2× / 锁定态长按回原速 / 上滑升档 / 下滑松手解锁 / 左亮度右音量<b>一行逻辑没重写</b>；window 前置桥、document 层、<code>&lt;video&gt;</code> 元素层继续兜底，单例 session 去重。手势激活后只掐冒泡，<b>绝不 <code>stopImmediatePropagation</code></b>（v2.0.5 教训 + 调研里 BilibiliHotkeyManager 明确警告会误伤其它扩展）。MutationObserver 也加了忽略自身 tile 重建的判断，避免自激循环。<br>⑤ <b>把两条硬边界写进诊断</b>：「📋 手势层诊断」会实测写一次 <code>playbackRate=2</code> 再读回（Apple 官方写着 iOS 上该属性可能不可写），并给出 <code>state = inline / web / full / system</code>。<code>rateWritable=false</code> 或 <code>state=system</code> 都如实标出来 —— 这两种情况下网页层做多少都不会有长按倍速，不该再一版版猜。<br><br><b>没动</b>：v2.1.6 的 document-start 前置桥与零点击解除静音、v2.1.5 三层捕获与探针、v2.1.4 的画面/弹幕/控制栏由 B 站自己排、F 转发 B 站网页全屏按钮、几何热区、单帧写入仲裁与 watchdog、自动起播收手、音量记忆、搜索零导航、三连、D 开关、R 刷新、v2.0.1 滚动保持、5 页签打赏页、v2.0.5 删除结论。</p></div>' +
+        '' },
+      { t: 'v2.1.6 · 遮罩裁剪 / 前置注入 / 零点击出声', open: false, h:
+        '<div class="bpe-card"><h3>你的两个判断都对，我前面漏了「注册顺序」和「遮罩抢 target」</h3><p>你说<b>「左右上下滑动都是音量」</b>——那其实是 B 站播放器自己的手势 HUD，说明触摸被 B 站完整消费了；你说<b>「是不是被弹幕遮罩挡住了，试试裁剪掉一部分」</b>——弹幕层 / 蒙版层确实是一块铺满画面、<code>pointer-events:auto</code> 的覆盖物，手指的 touch target 落在它上面，事件先被遮罩上的 B 站监听拿走。复盘下来还有第三处更致命的：<b>v2.1.5 虽然把监听挂到了 window 捕获，但脚本是 <code>@run-at document-idle</code> 注入的</b>，B 站脚本先加载、先在同一 window 节点上注册；DOM 对同一节点的监听按注册顺序执行，B 站一旦调 <code>stopImmediatePropagation()</code>，我们后注册的 window 监听照样收不到。三层、几何热区、ShadowRoot 全都在改「收到事件之后」的事，所以真机一直没用。<br><br><b>这版三件事一起做：</b><br>① <b><code>@run-at document-start</code> + 前置桥</b>：IIFE 最前面、B 站任何脚本执行之前就在 window 捕获占好坑，事件转发给 boot 后挂上的惰性处理器。这才真正保证「我们的监听先于 B 站」。<code>document</code> 层与 <code>&lt;video&gt;</code> 元素层仍保留，三层共用单例 session 去重。诊断里 <code>early.events / earlyRegistered / bootReadyState</code> 能一眼看清有没有抢占成功；若 Stay 实际仍在 idle 注入，会如实显示 <code>earlyRegistered=false</code>。<br>② <b>按你的方案裁剪弹幕遮罩</b>：给弹幕渲染层设 <code>pointer-events:none</code>，让 target 落到 <code>&lt;video&gt;</code>；给蒙版 / 遮罩层按「弹幕屏占比」用 <code>clip-path: inset(0 0 calc(100% - 屏占比) 0)</code> 只保留顶部一块，被裁区域同时不再参与命中测试。会尝试自动读 B 站播放器配置里的弹幕显示区域，读不到就用设置页选的值（1/4 / 半屏 / 3/4 / 全屏，默认 1/4）。<b>弹幕文字照常显示、控制栏与弹幕输入框不碰、一个布局属性都不改</b> —— 守住 v2.1.4 的教训。B 站动态重建弹幕层时 scan 会重新裁剪。新增「🛡 弹幕遮罩裁剪」组与「📋 遮罩诊断」。<br>③ <b>一进播放页就解除静音</b>：你问「都能自动播放了咋还不能解除禁音」——因为旧版 <code>audible = userHasGesture() &amp;&amp; …</code> 在刚进页面时预判没手势，主动设了 <code>muted=true</code>。这版不再预判，直接试带声音起播；万一仍走静音回退，就在 <code>play()</code> 成功的同一个 then() 里同步再 unmute 一次，配 160ms 看门狗：Apple 说无手势取消静音可能被 Safari 暂停，真暂停了就立即静音续播、画面不中断、首次真实手势兜底仍保留。用户主动暂停永远优先，v1.6.2「暂停一次就停住」不被破坏。<br><br><b>没动</b>：v2.1.4 的画面 / 弹幕 / 控制栏由 B 站自己排、F 转发 B 站网页全屏按钮、几何热区、长按 2× / 锁定态长按回原速 / 下滑松手解锁 / 左亮度右音量、单 keydown / 单 keyup / 单 MutationObserver、单帧写入仲裁与 watchdog、音量记忆、搜索零导航、三连、D 开关、R 刷新、v2.0.1 滚动保持、5 页签打赏页、v2.0.5 删除结论。</p></div>' +
+        '' },
+      { t: 'v2.1.5 · 触控仍无反应 + 自动播放不解除静音', open: false, h:
+        '<div class="bpe-card"><h3>这两个症状是同一个原因：网页根本没收到触摸事件</h3><p>你这次同时说「还是没有触控手势」和「自动播放不自动解除禁音了」—— 恰恰证明了根因不在倍速判定、也不在 unmute 逻辑，而在<b>事件根本没到脚本回调</b>：解除静音那段监听和触控监听一样，都挂在 <code>document</code> 捕获阶段。B 站播放器为了自己做进度 / 亮度 / 音量手势，常在更早加载的脚本里于 document 捕获阶段调用 <code>stopImmediatePropagation()</code>；我们的脚本 <code>document-idle</code> 才注入、监听后注册，于是被整个跳过。<b>前面几版都在改「收到事件之后」的判定，所以真机上一直没用。</b><br><br>还查到一处确凿的代码级误杀：<code>canStart()</code> 里写着 <code>path.some(n => n.nodeType === 11) return false</code>，本意是排除脚本自己的 Shadow DOM 面板，但 <b>B 站播放器大量使用 shadow root / Web Components</b>，手指落在弹幕层、遮罩层时 <code>composedPath()</code> 必然含 nodeType=11 → 每一次触摸都被无条件拒绝。<br><br><b>这版两处硬修：</b><br>① <b>监听提升到三层捕获</b>：<code>window → document → &lt;video&gt;/父级</code>。DOM 捕获顺序是 window 先于 document，window 层能绕开 B 站在 document 层的拦截；元素层兜底直达 target。三层共用单例 session 去重，不会重复写 <code>playbackRate</code> 或双份 HUD。<code>touchmove</code> 仍是条件式 <code>preventDefault</code>，短按与页面滚动不受影响。<br>② <b>只排除脚本自己的 shadow root（<code>n === sr</code>）</b>，B 站 shadow 内的触摸一律放行；几何热区判定不变（只看 <code>video.getBoundingClientRect()</code> 与落点）。<br>③ <b>unmute 手势监听同样提升到 window + document 两层</b>，事件从 <code>pointerdown / touchend / mousedown / keydown</code> 扩到 <code>pointerdown / touchstart / touchend / mousedown / keydown</code> —— 旧版只认 <code>touchend</code>，而 iPad 长按 / 系统手势常直接派发 <code>touchcancel</code>，永远等不到 touchend，静音起播后就一直没声音。音量控件的排除选择器也收紧了，旧版 <code>[class*="mute"]</code> 宽通配会误命中播放器外层容器。<br>④ <b>新增事件到达探针</b>：诊断里 <code>probe.window / document / element</code> 是三层各自收到触摸的次数、<code>lastReject</code> 是最后一次被拒原因、<code>unmuteProbe.events / attempts / stillMuted</code> 说明解除静音有没有被触发。<b>三层全为 0 就说明网页完全没收到触摸事件</b> —— 这样下次不用再猜。另在「🩺 自检」和 Stay 菜单保留「🔊 解除静音」手动兜底。<br><br><b>没动</b>：v2.1.4 撤回布局强改的结论（画面 / 弹幕 / 控制栏由 B 站自己排）、F 转发 B 站网页全屏按钮、几何热区、长按 2× / 锁定态长按回原速 / 下滑松手解锁 / 左亮度右音量、单 keydown / 单 keyup / 单 MutationObserver、v2.1.0 单帧写入仲裁与 watchdog、自动起播「一次就收手 / 暂停不抢播」、音量记忆、搜索零导航、三连、D 开关、R 刷新、v2.0.1 滚动保持、5 页签打赏页、v2.0.5 删除结论。</p></div>' +
+        '' },
+      { t: 'v2.1.4 · 画面消失 / 超出屏幕 / 触控全废修复', open: false, h:
+        '<div class="bpe-card"><h3>是我上一版把 B 站布局撑坏了，不是 iPad 的问题</h3><p><b>你三张截图说得很清楚</b>：按 F 后画面没了、弹幕散在页面顶部、控制栏消失、画面超出屏幕，长按 / 亮度 / 倍速一个都不出来。根因只有一个 —— v2.1.3 给「播放器容器」强加了 <code>.bpe-webfull { position:fixed; inset:0; width:100vw; height:100vh; ... !important }</code>，还把里面的 <code>video / video-area / player-row</code> 全写成 <code>100%</code>。B 站播放器的弹幕层、控制栏、进度条全靠<b>原来的 flex 布局与 absolute 定位上下文</b>工作，把这个中间层变成全屏 containing block 后，所有子元素按新坐标系重排 → 画面被挤没、弹幕跑到页顶、控制栏溢出。<b>触控也跟着废了</b>：热区绑的是那个被改坏的容器，几何位置已经不对。<br><br><b>这版全部撤回，按你说的「就在 B 站全屏基础上改造」：</b><br>① <b>删掉 <code>.bpe-webfull</code> 整段 CSS 与所有加 class 的代码</b>，脚本不再改播放器任何定位 / 尺寸 / 层级；覆盖粘贴时会主动清理上一版留在 DOM 上的残留 class。<br>② <b>F 改回只点 B 站自己的「网页全屏」按钮</b>（纯 CSS 状态，B 站自己排内部布局，画面一定在），系统全屏按钮被精确改道到它、<code>requestFullscreen / webkitEnterFullscreen</code> 仍全部吞掉，所以永不进 Fullscreen API、不会再弹「向下轻扫退出」。<br>③ <b>铺满只用 v1.2 那套 <code>&lt;video&gt;</code> inline <code>object-fit</code></b>（不改容器、不改祖先链、不加黑底，已验证不会黑屏 / 不会撑破布局）。<br>④ <b>触控热区改成纯几何判定</b>：只看 <code>video.getBoundingClientRect()</code> 与落点坐标 —— video 接近铺满视口就整屏是热区，普通观看就按 video 那块矩形（放宽 14px 覆盖弹幕 / 遮罩层）。<b>完全不依赖 B 站类名、容器结构、全屏状态标记</b>，B 站改版也不怕。移除容器专属监听，回到 document 的 Touch + Pointer 双通道（DOM 都在 document 里，事件一定收得到）。<br>⑤ <code>.bpe-touchzone</code> 只标记 <b>video 的直接父级</b>，作用仅剩关 iPad 长按系统菜单 + 给 video 设 <code>touch-action:none</code>，不改任何布局。<br><br><b>交互与既有功能全没动</b>：长按 2× / 锁定态长按临时回 1× 松手恢复 / 上滑升档并锁定 / 下滑松手解锁 / 左半屏亮度 / 右半屏音量 / 贴上方小胶囊 HUD；单 keydown / 单 keyup / 单 MutationObserver、v2.1.0 单帧写入仲裁与 watchdog、v1.7 官方 3× 让位、自动起播、音量记忆、搜索零导航、三连、D 开关、R 刷新、学习模式、v2.0.1 滚动保持、5 页签打赏页、v2.0.5 删除结论一律保留。</p></div>' +
+        '' },
+      { t: 'v2.1.3 · 彻底弃用系统全屏（已被 v2.1.4 撤回布局强改）', open: false, h:
+        '<div class="bpe-card"><h3>方向错了：前面几版都在「系统全屏」里修补丁</h3><p>你连着说「长按 / 亮度 / 音量啥也没有」，真因不在判定写窄，而在<b>你一直待在 iPadOS Safari 的 Fullscreen API 系统全屏里</b>（截图那句「bilibili.com 处于全屏模式 · 向下轻扫退出」就是它）。系统全屏会把 <code>&lt;video&gt;</code> 交给系统播放器、把触摸优先留给下滑退出，网页这层收不全 touch / pointer，<code>findVideo()</code> 也会因 <code>isConnected=false</code> 丢掉视频 → <code>Touch.canStart()</code> 连热区都判不到，所有手势一律不启动。<b>在那一层里再怎么改判定都没用。</b><br><br><b>这版换地基，按你说的「别用系统全屏，就在 B 站全屏基础上改造」：</b><br>① <b>硬禁用一切系统全屏入口</b>：吞掉 <code>requestFullscreen</code> / <code>webkitRequestFullscreen</code> / <code>webkitEnterFullscreen</code>，<b>删掉「原生播放器全屏」命令与键位</b>；检测到已处于系统全屏会立即退出并切到网页全屏；点 B 站自己的全屏按钮也只保证不滑进系统层，不掐断事件（v2.0.5 的教训：掐断 B 站事件会让站内导航降级成整页跳转，反而跳 App）。<br>② <b>F = 脚本自建 CSS 网页全屏</b>：给 B 站播放器容器加 <code>.bpe-webfull</code>（<code>position:fixed</code> 铺满 + <code>touch-action:none</code> + <code>!important</code> 压住 inline style），<b>DOM 始终留在 document 里、video 始终 connected</b>，弹幕 / 控制栏 / 输入框一个不删。不再转发 B 站全屏按钮，结果 100% 可控。<br>③ <b>触控热区换成这个容器本身</b>，并额外<b>在容器上再绑一套 touch / pointer 监听</b>；网页全屏态只排真控件（<code>input / button / a / ctrl-btn / progress / dm-input</code>），不再靠 <code>playerRoot()</code> 猜类名。双通道靠单例 session + <code>steps</code> 去重，不会重复写倍速。<br><br>所以系统全屏那条「向下轻扫退出」气泡与下滑手势<b>不是被删掉，而是根本进不去那一层了</b> —— 这是网页能做到的彻底解法，比承诺「删掉系统 UI」诚实。<br><br><b>交互沿用 v2.1.2</b>：长按 2× / 锁定态长按临时回 1× 松手恢复 / 上滑升档并锁定 / <b>下滑松手解锁回 1×</b> / 左半屏亮度 / 右半屏音量 / 贴上方小胶囊 HUD。v2.1.0 单帧写入仲裁、v1.7 官方 3× 让位、自动起播、音量记忆、搜索零导航、三连、D 开关、R 刷新、学习模式、v2.0.1 滚动保持、5 页签打赏页、v2.0.5 删除结论全部未动；仍是单 keydown / 单 keyup / 单 MutationObserver。</p></div>' +
+        '' },
+      { t: 'v2.1.2 · 移动端手势 / 长按仍不生效三处根因', open: false, h:
+        '<div class="bpe-card"><h3>「还是不行，长按还是没用」——找到三处叠加 + 一个系统层误会</h3><p><b>① iPad 长按系统菜单</b>：iPad Safari 长按画面约 500ms 会弹「拷贝 / 保存图像」callout，同时派发 <code>touchcancel</code>；旧版把 <code>touchcancel</code> 一律当放弃手势回原速 → 长按刚进 2× 就被打断。现在给播放器画面根加 <code>.bpe-touchzone</code> 关闭 <code>-webkit-touch-callout</code> / 文本选择，且<b>已激活的手势即使收到 touchcancel 也按正常结算</b>。<br><b>② 倍速被别人改回去了却不校正</b>：<code>Rate.correct()</code> 里有一句 <code>if (touchRate.active) return</code>，本意是别让 <code>restoreRate</code> 抢写，却把「B 站 / 其它脚本在 <code>ratechange</code> 回调里把倍速重置成 1×」也一并放过 —— 脚本写 2×、对方立刻写回，实机就是「没反应」。现在触控期间照常校正到 <code>intent</code>（脚本刚写的目标，不是旧记忆档位）。<br><b>③ 写入根本没落盘</b>：<code>Rate.set</code> 只排 <code>requestAnimationFrame</code>，iPad <b>系统全屏播放时 rAF 会被节流甚至暂停</b>，那一帧迟迟不执行。现在加 <b>90ms watchdog</b> 兜底，<code>flush()</code> 幂等，仍然只写一次。<br><b>④ 系统全屏误会</b>：截图顶部「bilibili.com 处于全屏模式 · 向下轻扫退出」是 <b>iPadOS Safari 的系统级 Fullscreen API 提示</b>，不在网页 DOM，网页脚本删不掉已显示的气泡、也禁不了系统下滑退出手势；而且系统全屏会<b>截留触摸</b>用于下滑退出，这也让手势更容易失效。解法：F 默认改走 B 站<b>「网页全屏」</b>（纯 CSS，不弹系统提示、不截留触摸），开关「F 优先网页全屏」可关。<br><br><b>交互向移动版靠拢</b>：<b>单指上下滑</b>（没到长按时长）左半屏调画面视觉亮度、右半屏调音量，完全不碰倍速；<b>长按</b>未锁定进临时 2×、<b>已锁定则临时回 1× 原速</b>，松手恢复手势前状态（锁定档还在）；按住到锁定秒数 → 锁定；长按中上滑升档并锁定，<b>下滑再松开是唯一「恢复原速 / 解除锁定」的手势</b>。HUD 换成贴画面上方边缘的小胶囊（不挡中央人脸）+ B 站移动版风格细进度条，1.6s 自动淡出。<br><br><b>如实边界</b>：iPad Safari 的 <code>video.volume</code> 只读恒为 1，系统音量只由侧键 / 控制中心控制，网页无权读写 —— 右半屏手势在 iPad 上<b>只显示明确指引，不写假数值、不骗你说已调</b>；桌面 / <code>volume</code> 可写环境会真正写入。亮度是给 <code>&lt;video&gt;</code> 加 <code>filter:brightness()</code> 的<b>画面视觉亮度</b>，不是系统亮度，且用样式表 <code>!important</code> + CSS 变量，不会被铺满增强重写 inline style 冲掉。<br><br><b>没动</b>：单 keydown / 单 keyup / 单 MutationObserver、v2.1.0 单帧写入仲裁、v1.7 官方 3× 让位、自动起播收手、音量记忆、搜索零导航与双入口、三连、D 弹幕开关、R 刷新验证、学习模式占位、dock 去重、v2.0.1 滚动保持、5 页签与打赏页、v2.0.5 删除结论。</p></div>' +
+        '' },
+      { t: 'v2.1.1 · 手指长按 / 上滑不生效修复', open: false, h:
+        '<div class="bpe-card"><h3>你反馈的两句，都是我上一版判断写窄了</h3><p><b>①「手指长按也得有反应」</b>：旧 <code>isInteractive()</code> 用了 <code>[class*="control"]</code> / <code>[class*="ctrl-"]</code> / <code>[class*="panel"]</code> 这类<b>宽通配</b>，B 站播放器根 / 遮罩层类名一带 <code>control</code> 就被误判成「控制栏按钮」直接排掉；<code>inVideoArea()</code> 又只认 <code>.bpx-player-video-area</code> 等固定类名，而 iPad 上手指实际按到的是 <code>&lt;video&gt;</code> <b>上面那层弹幕 / 遮罩 div</b>。两个叠加 → 手势根本没启动，鼠标按在 <code>&lt;video&gt;</code> 上却碰巧能过，所以看起来「只支持鼠标」。<br>修法：排除列表收窄成<b>标准可交互元素 + 具体控制条类名</b>；热区改为 <code>playerRoot()</code> —— 从当前 <code>&lt;video&gt;</code> 向上最多 8 层找到播放器根容器，再判断手指落点是否在该根的祖先链内。<b>不再依赖任何固定类名</b>，B 站改版也不怕，弹幕层 / 遮罩层 / 画面任意位置都能起手势。<br><br><b>②「按上不顶用，没有倍速」</b>：上一版只挂 Pointer Events 且<b>全部 passive</b>。iPad Safari 上手指<b>上滑会被系统判定为滚动页面</b>，于是立刻派发 <code>pointercancel</code>；旧代码把 <code>pointercancel</code> 无条件当作「放弃手势」回原速 —— 一滑就断，档位根本没机会改。<br>修法：新增<b>原生 Touch Events 通道</b>（<code>touchstart / touchmove / touchend / touchcancel</code>）。<code>touchmove</code> 用 <code>{passive:false}</code>，且<b>只在临时倍速已激活后</b>才条件式 <code>preventDefault()</code> 阻止页面滚动 —— 未激活 / 短按 / 普通滑动完全放行，页面滚动、B 站单击暂停、双击全屏、控制栏照常。检测到触屏通道时 <code>pointercancel</code> 直接忽略，交给 <code>touchend / touchcancel</code> 结算。<code>move / end</code> 去掉 <code>pointerId</code> 严格校验，改成单例会话 + <code>steps</code> 去重，Pointer 与 Touch 双通道不会互相卡住或重复写倍速。<br><br>诊断新增 <code>source</code>（<code>touch</code> / <code>pointer</code>）与 <code>touchSeen</code>，一眼能看出这次手势走的是手指还是鼠标。<b>没动</b>：单 keydown / 单 keyup / 单 MutationObserver、v2.1.0 的单帧写入仲裁、v1.7 官方 3× 让位、搜索 / 三连 / D 开关 / R 刷新 / 起播 / 音量 / 全屏 / 打赏页 / 滚动保持，以及 v2.0.5 的删除结论。</p></div>' +
+        '' },
+      { t: 'v2.1.0 · 触控倍速 + 倍速写入仲裁', open: false, h:
+        '<div class="bpe-card"><h3>你要的两件事都做了，且没动任何旧功能</h3><p><b>① 触控倍速</b>：按住视频画面 <code>280ms</code> 进临时 <b>2×</b>（松手回长按前的倍速）；按住到 <b>10s</b>（3–60s 可自定义）自动锁定当前倍速，松手保持；长按期间<b>上滑升档 / 下滑降档</b>（按档位表走，默认每 44px 一档），滑动后松手也锁定当前档。锁定后画面右侧出现 <b>🔒 倍速徽标</b>，点它 / 设置页「解除锁定」/「↩︎ 回 1×」都能解除并回到长按前的倍速。<b>全屏与非全屏都可用</b>：非全屏只在视频画面热区生效，全屏放宽到整屏；设置面板、搜索浮层、控制栏、输入框、按钮、脚本自己的 UI 一律不抢。<b>短按完全不碰播放状态</b>，B 站原生单击暂停 / 双击全屏照常。<br><br><b>实现约束（查证过）</b>：B 站 App 的「长按 2×」是触屏标配，但网页播放器没有，得自己写；KodeLab 的 iPad Safari 真机踩坑记录写明「不 preventDefault 时 Pointer Events 正常继续，preventDefault 反而触发 pointercancel 让后续事件全消失」→ 本模块<b>一律 passive、绝不 preventDefault / stopPropagation</b>，<code>pointercancel</code> 当作放弃手势回原速。所有滑动写入都走下面的仲裁层，不会连拍解码器。<br><br><b>② 升降档「卡一下」修好了</b>。根因三条（都有资料）：commaai/connect#595 指出<b>每次写 <code>playbackRate</code> 都会打到音频解码器</b>，连续快速写会触发重初始化 → iOS Safari 爆音 / 卡顿；CSDN 倍速控制文指出网站在 <code>ratechange</code> 里重置倍速时会「变快又弹回像被拍一下」；hls.js 讨论区说 Safari 的 rate change 有 <b>100–500ms 非确定性延迟</b>。对照旧代码：每次按键都 <code>findVideo()</code> 全量扫 DOM + 同步 <code>save()</code> 序列化 + <code>toast()</code> 重绘 + 立即写倍速；<code>restoreRate</code> 挂在 6 个媒体事件上连发；<code>endOfficialHold</code> 还 0/60/180ms <b>连写三次</b>。现在：所有写入进 <code>Rate.set</code> 用 <b>requestAnimationFrame 合并，同一帧只写最后一次</b>；<code>ratechange</code> 只在偏离 <code>intent</code> 时排一次下一帧校正；<code>save()</code> 防抖 160ms、toast 140ms 节流；<code>stepRate</code> 改用缓存的 <code>curVideo</code>；<code>endOfficialHold</code> 改成一次写入 + 一帧复核。<br><br><b>冲突矩阵</b>：单 keydown / 单 keyup / 单 MutationObserver 不变，新增的是独立 pointer 通道；首次手势解除静音、自动起播收手、音量记忆、v1.7 长按相反档键回 1×、官方长按右方向键 3×、搜索零导航与双入口、三连、D 弹幕开关、R 刷新验证、学习模式占位、F 全屏转发、dock 去重、v2.0.1 滚动保持、5 页签与打赏页全部未动。<code>officialHold.active</code> 或触控手势进行中，<code>restoreRate</code> 与 <code>ratechange</code> 校正都让位，绝不两路抢写。</p></div>' +
+        '' },
+      { t: 'v2.0.5 · 彻底移除防跳转 / 去 App 横幅', open: false, h:
         '<div class="bpe-card"><h3>你让我「再检查一遍到底哪里出问题」：结论是脚本自己</h3><p>先按你的要求<b>彻底删除</b>了整套功能：两个配置键 <code>blockAppBanner / blockAppJump</code>、开关、CSS 规则、<code>APP_SCHEME / appJumpUrl / biliPageUrl</code>、<code>syncAppMeta / sweepAppBanner / installAppGuard / patchPageLocation / patchAnchorClick / installNativeNavGuard</code>、scheme iframe 清理、<code>appRules / appDiag</code> 命令与菜单入口、自检按钮与提示、更新日志里 v2.0.2~2.0.4 三张卡、教程页对应卡与独立规则文件，全部不留死代码；旧配置键在迁移时一并 <code>delete</code>。<br><br><b>复查结论（与你的实机证据一致，但如实说是最可能而非 100% 实机确认）</b>：你点的是 <code>www.bilibili.com</code> <b>站内</b>的视频 / 主页 / 关注 / 粉丝 / 动态。按 Apple 的 same-domain 规则，Safari 里已打开该域名时点<b>同域</b>链接通常留在 Safari，本来不该跳 App。它却跳了，说明这次导航<b>不是 B 站 SPA 的 <code>preventDefault</code> + <code>router.push</code></b>，而是被降级成「浏览器发起的全新整页 https 导航」，命中 AASA 的 <code>applinks</code> 路径，iOS 才把点击交给 App。谁降的级？<b>就是脚本自己</b>：① v2.0.0/2.0.1 在捕获阶段 <code>stopImmediatePropagation()</code>，掐断 B 站 SPA handler，浏览器回退到 <code>&lt;a&gt;</code> 原生 href（B 站给这些卡片配的正是唤起地址）；② v2.0.3/2.0.4 的 <code>installNativeNavGuard()</code> 在冒泡阶段读 <code>e.defaultPrevented</code> 判断「SPA 没接管」就 <code>preventDefault()</code> + <code>setTimeout(0)</code> 里 <code>location.assign(https://…)</code> —— B 站的事件委托 handler 常在更外层或后注册，脚本先跑时 <code>defaultPrevented</code> 还是 false，于是把站内 SPA 跳误判成整页导航，亲手造出一次会被系统接管的全新导航；③ <code>patchPageLocation()</code> 改 <code>Location.prototype</code>、<code>patchAnchorClick()</code> 包 <code>HTMLAnchorElement.prototype.click</code>、<code>syncAppMeta()</code> 动 <code>&lt;head&gt;</code>、<code>sweepAppBanner()</code> 扫 iframe，全是全局原型 / DOM 级干扰。<b>这正好解释你最早那句「开着反而跳、关了反而不跳」</b>：关掉开关 = 没有这套拦截 = B 站 SPA 正常工作 = 不跳。所以删除不是放弃拦截，是移除制造跳转的那一层。<br><br><b>顺带复查 <code>installSearchGuard()</code></b>：它只匹配搜索表单 <code>submit</code>、<code>search.bilibili.com</code> / <code>m.bilibili.com/search</code> / <code>/search?keyword</code> 链接，以及 <code>window.open</code> 到搜索域，<b>普通视频 / 主页链接不在匹配范围</b> —— 清白，零导航搜索原样保留。<br><br><b>验证方法</b>：覆盖粘贴并刷新 → 点视频 / 主页 / 关注 → 应留在站内。若留住，根因确认。<b>诚实边界</b>：若删除后<b>仍</b>跳，那才是纯系统层 Universal Link（链接指向 <code>space.</code> / <code>m.</code> 等已关联子域、或从别的 App 点进来），网页脚本无解，只能长按链接选「在 Safari 中打开」、卸载 B 站 App，或用 Safari 扩展（拦截100 / AdGuard / wBlock）；本脚本不再加入任何拦截代码。<br><br><b>没动的东西</b>：搜索零导航与双入口、倍速、全屏、起播收手、音量记忆、三连、D 弹幕开关、R 刷新验证、v1.7 占位文字、v2.0.1 滚动保持、5 页签与打赏页、定名与署名。仍是单 keydown / 单 keyup / 单 MutationObserver。</p></div>' +
         '' },
       { t: 'v2.0.1 · 设置页不再回顶', open: false, h:
@@ -3678,6 +5970,9 @@
         CFG[k] = t.type === 'checkbox' ? t.checked : (t.type === 'number' ? Number(t.value) : t.value);
         if (k === 'preferredVolume') CFG[k] = Math.min(1, Math.max(0, CFG[k] || 0));
         if (k === 'holdThresholdMs') CFG[k] = Math.min(1200, Math.max(120, Number(CFG[k]) || 340));
+        if (k === 'touchHoldMs') CFG[k] = Math.min(1200, Math.max(120, Number(CFG[k]) || 280));
+        if (k === 'touchLockSec') CFG[k] = Math.min(60, Math.max(3, Number(CFG[k]) || 10));
+        if (k === 'touchSlidePx') CFG[k] = Math.min(160, Math.max(16, Number(CFG[k]) || 44));
         save(); applyCfg(); render();
       }
       if (t.dataset.key) {
@@ -3941,14 +6236,29 @@
   }
   function scan() {
     findVideo();
+    GestureLayer.apply('scan');      // v2.1.7：画面/控件/全屏变化后重建手势区
+    TouchV3.install();               // v2.3.0：绑播放器元素（非根），显式 passive:false
     if (CFG.enabled && CFG.autoPlay) autoPlayVideo(findVideo());  // 晚插入的 video 也能自动起播
     fillWatchdog();   // B 站切全屏会改 DOM 类名，这里比 900ms 定时更及时
     if (CFG.enabled && (CFG.learnMode || CFG.showBlockButtons)) scanCards();
     updateBar();
   }
-  const observer = new MutationObserver(() => scheduleScan());
+  const observer = new MutationObserver(records => {
+    // v2.1.7：手势层重建 tiles 会改 DOM，忽略它自己造成的 mutation，避免自激循环
+    try {
+      if (records && records.length && records.every(r => GestureLayer.contains(r.target))) return;
+    } catch (e) {}
+    scheduleScan();
+  });
   function applyCfg() {
     document.documentElement.classList.toggle('bpe-enabled', !!CFG.enabled);
+    GestureLayer.apply('applyCfg');  // v2.1.7：开关改动即时生效
+    // v2.1.2：关掉「左亮度 / 右音量」后立刻还原画面滤镜，不留残影
+    if (!CFG.touchBrightVolume && document.documentElement.classList.contains('bpe-bright')) {
+      document.documentElement.classList.remove('bpe-bright');
+      document.documentElement.style.removeProperty('--bpe-bright');
+      CORE.bright.value = 1;
+    }
     if (!CFG.enabled || !CFG.fillEnabled) resetVideoFill(true);
     else if (Fill.active) { Fill.lastMode = ''; updateVideoFill(); }
     if (!CFG.learnMode) {
@@ -3987,30 +6297,57 @@
         GM_registerMenuCommand('📋 复制刷新诊断（R 键为什么没刷新）', () => Bus.exec('refreshDiag'));
         GM_registerMenuCommand('🎬 立即尝试自动起播', () => Bus.exec('autoPlayNow'));
         GM_registerMenuCommand('🔐 登录自检（排查「账号未登录」）', () => Bus.exec('loginCheck'));
-        GM_registerMenuCommand('⛶ 全屏 / 铺满切换（转发 B 站按钮）', () => Bus.exec('fullscreen'));
+        GM_registerMenuCommand('⛶ 网页全屏 / 退出（不进系统全屏）', () => Bus.exec('fullscreen'));
         GM_registerMenuCommand('⇄ 切换填充模式', () => Bus.exec('fillToggle'));
         GM_registerMenuCommand('🧹 复位全屏状态（黑屏自救）', () => Bus.exec('fillReset'));
         GM_registerMenuCommand('⚡ 倍速 1× / 2× 切换', () => Bus.exec('rate', Math.abs((CFG.rate || 1) - 2) < 0.01 ? 1 : 2));
+        GM_registerMenuCommand('📋 复制触控诊断（passive / 倍速可写 / 全屏层）', () => Bus.exec('touchV3Diag'));
+        GM_registerMenuCommand('🔔 测试提示层（HUD 是否可见）', () => Bus.exec('touchHudTest'));
+        GM_registerMenuCommand('🔓 解除触控锁定回 1×', () => Bus.exec('touchV3Unlock'));
+        GM_registerMenuCommand('☀ 复位画面视觉亮度', () => Bus.exec('brightReset'));
+        GM_registerMenuCommand('🔊 立即解除静音', () => Bus.exec('unmuteNow'));
+        GM_registerMenuCommand('⛶ B 站网页全屏 / 退出', () => { WebFull.toggle('Stay 菜单'); toast('⛶ 已切换 B 站网页全屏'); });
       } catch (e) { LOG('Menu', '注册失败：' + e.message); }
     }
     observer.observe(document.documentElement, { childList: true, subtree: true });
-    /* v1.6.3：手势回调只做两件事 —— 记录手势时间 + 同步解除静音。
-       Apple《为 Safari 传送视频内容》：在没有用户手势的情况下取消静音会暂停播放；
-       所以 unmute 必须在这个真实手势回调里同步执行，不能 setTimeout、不能在 play().then()。
-       旧版「play().then() + 60ms setTimeout + 还得等下一次手势」正是开播 1~2 秒没声音的根因。
-       绝不在手势里补播（v1.6.2 的「暂停一次就停住」保持不变）。 */
-    ['pointerdown', 'touchend', 'mousedown', 'keydown'].forEach(t =>
-      document.addEventListener(t, e => {
-        const first = !CORE.gestureSeen;
-        CORE.gestureSeen = true;
-        CORE.lastGestureAt = Date.now();
-        const v = findVideo();
-        if (!v) return;
-        const inVolume = e.target && e.target.closest &&
-          e.target.closest('[class*="volume"], [class*="voice"], [class*="mute"]');
-        if (CFG.enabled && CFG.autoUnmute && v.muted && !inVolume) unmuteNow(v, '真实手势同步');
-        if (first) apNote('已捕获首次真实手势 · 已同步解除静音（不补播）', { readyState: v.readyState });
-      }, { capture: true, passive: true }));
+    /* v2.1.5：解除静音的手势监听同样提升到 window 捕获层。
+       旧版只挂 document 的 ['pointerdown','touchend','mousedown','keydown']：
+       ① B 站在 document 捕获层 stopImmediatePropagation 时根本收不到；
+       ② 只认 touchend，而 iPad 长按/系统手势常直接派发 touchcancel，
+          永远等不到 touchend → 静音起播后就一直没声音。
+       现在 window + document 两层、5 种事件，任何一次真实交互都会同步 unmute。 */
+    function onUserGesture(e, layer) {
+      const U = CORE.unmuteProbe;
+      U.events++; U.lastLayer = layer;
+      const first = !CORE.gestureSeen;
+      CORE.gestureSeen = true;
+      CORE.lastGestureAt = Date.now();
+      const v = findVideo();
+      if (!v) { U.lastReason = '未找到视频'; return; }
+      // 收紧：只在明确的静音 / 音量控件上让行，旧版 [class*="mute"] 宽通配
+      // 会误命中播放器外层容器，把手势判成「用户在调音量」而跳过 unmute。
+      let inVolume = false;
+      try {
+        inVolume = !!(e.target && e.target.closest && e.target.closest(
+          '[class*="volume-panel"],[class*="volume-control"],[class*="voice-panel"],' +
+          '[aria-label*="音量"],[class*="bpx-player-ctrl-volume"],[class*="bpx-player-ctrl-muted"]'));
+      } catch (_) {}
+      if (CFG.enabled && CFG.autoUnmute && v.muted && !inVolume) {
+        U.attempts++;
+        const ok = unmuteNow(v, '真实手势同步 · ' + layer);
+        U.lastReason = ok ? '已在手势回调内同步解除静音' : '未解除（userMuted / 已非静音）';
+        U.stillMuted = !!v.muted;
+      } else {
+        U.lastReason = v.muted ? ('仍静音：' + (inVolume ? '落在音量控件内' : '自动解除静音已关 / 用户主动静音'))
+                              : '视频本来就没静音';
+        U.stillMuted = !!v.muted;
+      }
+      if (first) apNote('已捕获首次真实手势 · ' + layer, { readyState: v.readyState, layer: layer });
+    }
+    ['pointerdown', 'touchstart', 'touchend', 'mousedown', 'keydown'].forEach(t => {
+      window.addEventListener(t, e => onUserGesture(e, 'window'), { capture: true, passive: true });
+      document.addEventListener(t, e => onUserGesture(e, 'document'), { capture: true, passive: true });
+    });
     /* v1.6.3：iPad Safari 上 volume 只读、恒为 1，硬件音量键不触发 volumechange，
        所以额外从 B 站音量控件的真实数值（value / aria-valuenow）记「用户意图音量」。
        只在音量控件内生效，读不到数值就只记「见过滑块」，绝不编造。 */
@@ -4039,7 +6376,11 @@
     window.addEventListener('focus', () => restoreShortcuts('focus'));
     // 任何全屏状态变化都由 watchdog 统一判定：进则加 inline，退则原样还原
     ['fullscreenchange', 'webkitfullscreenchange', 'webkitbeginfullscreen', 'webkitendfullscreen', 'resize', 'orientationchange']
-      .forEach(t => document.addEventListener(t, () => setTimeout(fillWatchdog, 180)));
+      .forEach(t => document.addEventListener(t, () => setTimeout(() => {
+        fillWatchdog();
+        // v2.1.7：画面矩形一变就立刻重算 tiles / 控件洞，不等 900ms tick
+        GestureLayer.apply(t);
+      }, 180)));
     let lastUrl = location.href;
     setInterval(() => {
       updateKbdState();
@@ -4056,11 +6397,45 @@
       // 单一入口，不再每 900ms 无谓多跑一次 apAllowed。
     }, 900);
     setInterval(scheduleScan, 2500);
+    /* v2.1.6：把前置桥的惰性处理器挂上。桥在 document-start 就注册好了，
+       这里只补上真正的 Touch 转发与 unmute 手势处理。 */
+    window.__BPE_H__ = {
+      touch(t, e) {
+        const P = CORE.touchProbe;
+        P.window++; P.lastLayer = 'window';
+        if (t === 'pointerdown') { P.pointerdown++; Touch.start(e); }
+        else if (t === 'pointermove') Touch.move(e);
+        else if (t === 'pointerup') Touch.end(e, false);
+        else if (t === 'pointercancel') {
+          const s = Touch.session;
+          if (s && s.touchSeen) return;
+          Touch.end(e, true);
+        } else if (t === 'touchstart') {
+          P.touchstart++;
+          const ev = touchEv(e, 'touchstart');
+          const s = Touch.session;
+          if (s) { s.touchSeen = true; s.source = 'touch'; s.startY = ev.clientY; s.startX = ev.clientX; return; }
+          Touch.start(ev);
+        } else if (t === 'touchmove') {
+          Touch.move(touchEv(e, 'touchmove'));
+          const s = Touch.session;
+          if (s && (s.active || s.mode === 'bright' || s.mode === 'volume')) {
+            try { e.preventDefault(); } catch (_) {}
+          }
+        } else if (t === 'touchend') Touch.end(touchEv(e, 'touchend'), false);
+        else Touch.end(touchEv(e, 'touchcancel'), true);
+      },
+      gesture(e, layer) { onUserGesture(e, layer); }
+    };
+    CORE.earlyRegistered = !!(window.__BPE_EARLY__ && window.__BPE_EARLY__.registered);
+    CORE.bootReadyState = document.readyState;
+    LOG('Boot', '前置桥已接上 · window 捕获层在 B 站脚本之前注册 = ' + CORE.earlyRegistered +
+      ' · boot 时 readyState=' + CORE.bootReadyState);
     applyCfg();
     render();
     updateBar();
     CORE.booted = true;
-    LOG('Boot', 'BilibiliPlus Xi/Elio v' + CORE.version + ' 启动完成 · 全屏=转发按钮+video inline · Stay 能力 ' + Object.keys(CAP).filter(k => CAP[k]).length + '/9');
+    LOG('Boot', 'BilibiliPlus Xi/Elio v' + CORE.version + ' 启动完成 · 极简竖条 HUD / 倍速拖动修复 · 短按仍放行 · Stay 能力 ' + Object.keys(CAP).filter(k => CAP[k]).length + '/9');
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot, { once: true });
   else boot();
